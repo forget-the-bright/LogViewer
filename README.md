@@ -9,6 +9,7 @@
 把字节流转发给浏览器。详见 [docs/architecture.md](docs/architecture.md)。
 
 ---
+<img width="1920" height="911" alt="image" src="https://github.com/user-attachments/assets/7c1faee2-53fe-474f-92a4-ecc317a9da3f" />
 
 ## 功能特性
 
