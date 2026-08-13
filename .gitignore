@@ -1,0 +1,63 @@
+# ========== Go 编译产物 ==========
+*.exe
+*.out
+*.test
+*.prof
+dist/
+.build_tmp/
+bin/
+build/
+
+# Go 模块缓存、临时文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ========== 配置与运行时生成文件 ==========
+# 程序运行生成的用户配置、导出日志
+configs/*.json
+!configs/template.json       # 保留模板配置，注释掉这行不想保留模板就删掉
+export_logs/
+*.log
+*.out
+
+# ========== OS 系统垃圾文件 ==========
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+._*
+
+# ========== 前端资源（如使用独立静态文件夹，非embed模式） ==========
+# 如果前端是单独vue项目放开下面
+# frontend/node_modules/
+# frontend/dist/
+# frontend/.vite/
+# frontend/npm-debug.log*
+
+# ========== 临时调试、本地环境文件 ==========
+*.env
+*.env.local
+local_config.json
+tmp/
+temp/
+
+# ========== 编辑器相关 ==========
+# Goland/IDEA
+.idea/
+*.iml
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# ========== 交叉编译脚本无关临时文件 ==========
+sha256sum.txt

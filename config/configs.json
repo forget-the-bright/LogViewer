@@ -1,0 +1,29 @@
+{
+  "default_name": "默认配置",
+  "configs": {
+    "默认配置": {
+      "ConfigName": "默认配置",
+      "FollowTail": true,
+      "ReadLinesLimit": 200,
+      "Encoding": "utf-8",
+      "CaseSensitive": false,
+      "InvertMatch": false,
+      "ContextBefore": 0,
+      "ContextAfter": 0,
+      "UseRegex": false,
+      "FilterRule": {
+        "TimeStart": "",
+        "TimeEnd": "",
+        "TimePrecision": "second",
+        "Levels": null,
+        "Content": "",
+        "Exclude": "",
+        "CustomRegex": ""
+      },
+      "HighlightRules": [
+        "ERROR",
+        "WARN"
+      ]
+    }
+  }
+}

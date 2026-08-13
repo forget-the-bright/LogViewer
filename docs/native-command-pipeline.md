@@ -1,0 +1,144 @@
+# 原生命令管道设计
+
+本文档说明"Go 只是外壳"原则下，各类配置是如何映射成 Unix / Windows 原生命令的。
+所有命令都在 `internal/cmdbuild/cmdbuild.go` 中构建。
+
+## 1. 读取：跟踪与静态
+
+### Unix
+
+- 跟踪：`tail -F [-n N] <file>`（`-F` 跟 inode，文件被轮转/重建后自动重连）
+- 静态全量：`cat <file>`
+- 静态末 N 行：`tail -n N <file>`
+
+### Windows
+
+- 跟踪且有 N：
+  ```powershell
+  [Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8;
+  & { Get-Content -LiteralPath <file> -Encoding UTF8 -Tail N;
+      Get-Content -LiteralPath <file> -Encoding UTF8 -Wait -Tail 0 }
+  ```
+  第一段立即吐末 N 行，第二段从末尾跟随。
+- 跟踪无 N：`Get-Content -Wait`
+- 静态全量：`[IO.File]::ReadLines(<file>, [Text.Encoding]::UTF8)`（比 `Get-Content` 快）
+- 静态末 N 行：`Get-Content -Tail N`
+
+开头强制设置 `[Console]::OutputEncoding=UTF8`，保证管道里是 UTF-8 字节，Go 端无需再转码。
+
+## 2. 编码（GBK）
+
+- Unix：在读取命令后接 `iconv -f GBK -t UTF-8`。
+- Windows：
+  - `Get-Content` 用 `-Encoding OEM`（系统 ANSI 代码页，中文环境即 GBK）；
+  - `ReadLines` 用 `[Text.Encoding]::GetEncoding('GBK')` 读取。
+  由于前面已把控制台输出编码设成 UTF-8，进程吐给 Go 的就是 UTF-8。
+
+## 3. 时间范围 —— 字符串比较，而不是正则枚举
+
+ISO 时间戳 `YYYY-MM-DD HH:MM:SS` 是**定长 19 字符**，字典序与时间序完全一致。
+所以时间过滤不需要、也不应该用正则枚举起止之间的每一秒（范围一大正则会爆炸），
+而是做字符串比较。命令长度恒定，与时间跨度无关。
+
+### Unix：awk，带状态保留续行
+
+```awk
+{ if (match($0, /[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    t=substr($0,RSTART,RLENGTH); keep=(t>=s && t<=e)
+  }
+  if (keep) print; fflush() }
+```
+
+- `-v s=... -v e=...` 传参，避免注入；
+- `$script:_keep`（awk 里是普通变量）跨记录保持状态：一行带时间戳，决定它自己以及
+  随后**不带时间戳的续行**（如 Java 堆栈）是否保留；
+- `fflush()` 保证 follow 模式实时输出。
+
+### Windows：Where-Object，带状态
+
+```powershell
+| Where-Object {
+    if ($_ -match '<timeTokenPattern>') {
+      $t=$Matches[0]
+      $script:_keep = ($t -ge '<start>' -and $t -le '<end>')
+    }
+    $script:_keep
+  }
+```
+
+`$script:_keep` 在管道对象之间保持状态，同样让无时间戳的堆栈续行跟随上一行的判定。
+
+时间端点由 Go 侧 `TimeBounds` 按粒度对齐成秒级闭区间：
+
+| 粒度   | start 补齐      | end 补齐        |
+| ------ | --------------- | --------------- |
+| day    | `00:00:00`      | `23:59:59`      |
+| hour   | `:00:00`        | `:59:59`        |
+| minute | `:00`           | `:59`           |
+| second | 原样            | 原样            |
+
+## 4. 内容过滤 —— 一条短正则
+
+级别和内容由 `AssemblePattern` 拼成一条正则交给 `grep -E` / `Select-String`：
+
+- 多个级别用 `|` 做 OR：`(?:ERROR|WARN)`；
+- 级别和内容之间用 `.*` 连接，表示 AND；
+- 普通文本模式下内容用 `regexp.QuoteMeta` 转义成字面量；
+- 自定义正则（仅在勾选"正则"时生效）优先级最高，直接整条使用，并跳过时间阶段。
+
+### Unix 管道
+
+```
+... | grep -E [-i] [-v] [-B N] [-A N] [--line-buffered] '<pattern>'
+    | grep -v [-E|-F] [-i] [--line-buffered] '<exclude>'
+```
+
+follow 模式下加 `--line-buffered`，避免大块缓冲导致延迟。
+
+### Windows 管道
+
+```
+... | Select-String [-CaseSensitive] [-NotMatch] [-Context B,A] -Pattern '<pattern>'
+    | Select-String -NotMatch [-SimpleMatch] [-CaseSensitive] -Pattern '<exclude>'
+    | ForEach-Object { $_.Line }   # 有上下文时拼成 Pre+Line+Post
+```
+
+- 排除关键词独立一轮 `-NotMatch`，对应"排除"语义；
+- `-SimpleMatch` 对应普通文本（非正则）模式。
+
+## 5. 原样导出
+
+不经过任何过滤，字节级原样输出：
+
+- Unix：`cat <file>`
+- Windows：
+  ```powershell
+  $c=[IO.File]::OpenRead('<file>')
+  try { $c.CopyTo([Console]::OpenStandardOutput()) } finally { $c.Close() }
+  ```
+  用 .NET 文件流直接拷到标准输出，避免 `Get-Content` 逐行解析带来的开销。
+
+## 6. 引号与转义
+
+所有进入命令的用户可控字符串（文件路径、模式）都必须转义：
+
+- Unix `shQuote`：包单引号，内部 `'` → `'\''`。
+- PowerShell `psQuote`：包单引号，内部 `'` → `''`。
+
+时间端点和模式都通过这两个函数注入，杜绝 shell 注入。
+
+## 7. 一条完整示例
+
+跟踪模式、UTF-8、末 200 行、ERROR 或 WARN、含 `timeout`、排除 `health`、
+2026-08-13 全天、大小写不敏感：
+
+Unix 大致为：
+
+```sh
+tail -F -n 200 '/var/log/app.log' \
+  | awk -v s='2026-08-13 00:00:00' -v e='2026-08-13 23:59:59' '<prog>' \
+  | grep -E -i --line-buffered '(?:ERROR|WARN).*timeout' \
+  | grep -v -F -i --line-buffered 'health'
+```
+
+Windows 为等价的 `Get-Content -Wait` + `Where-Object` + `Select-String` 管道。

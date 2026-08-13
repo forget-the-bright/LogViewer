@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LogViewer 日志查看工具</title>
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/vendor/flatpickr.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">LogViewer</div>
+  <div class="roots">
+    <label>工作目录：</label>
+    <select id="rootSelect" title="选择根工作目录"></select>
+    <button id="refreshTreeBtn" title="刷新目录树">刷新</button>
+  </div>
+  <div class="spacer"></div>
+  <button id="themeToggle" title="切换白天/黑夜主题">🌙 黑夜</button>
+  <div id="connStatus" class="status offline"><span class="dot"></span><span id="connText">未连接</span></div>
+</header>
+
+<div id="main">
+  <!-- 左侧：目录树 -->
+  <aside id="treePanel">
+    <div class="tree-header">
+      <span class="panel-title">日志文件</span>
+      <button id="sidebarCollapse" class="sidebar-toggle" title="收起侧栏">◀ 收起</button>
+    </div>
+    <div id="tree"></div>
+  </aside>
+  <!-- 侧栏收起后的展开条 -->
+  <div id="sidebarReopen"><button title="展开侧栏">▶ 日志文件</button></div>
+
+  <!-- 右侧：配置 + 终端 -->
+  <main id="content">
+    <section id="configPanel">
+      <div class="cfg-quickbar">
+        <button id="cfgToggle" class="cfg-toggle" title="折叠/展开配置">▾ 收起配置</button>
+        <span class="brand-mini">过滤配置</span>
+        <select id="configSelect" title="已保存配置"></select>
+        <select id="followTail" title="查看模式">
+          <option value="true">实时跟踪 (tail -F)</option>
+          <option value="false">静态加载</option>
+        </select>
+        <input id="filePath" type="text" placeholder="已选日志文件路径（也可手动填写）" readonly>
+        <button id="startBtn" class="btn-primary">开始跟踪</button>
+        <button id="stopBtn" class="btn-danger" disabled>停止跟踪</button>
+      </div>
+      <div class="cfg-body" id="cfgBody">
+        <div class="cfg-row cfg-header">
+          <input id="cfgName" type="text" placeholder="配置名称" class="cfg-name-input">
+          <button id="loadCfgBtn" title="加载选中配置">加载</button>
+          <button id="saveCfgBtn" title="保存当前配置">保存</button>
+          <button id="saveAsCfgBtn" title="另存为">另存</button>
+          <button id="delCfgBtn" title="删除配置">删除</button>
+          <button id="setDefaultCfgBtn" title="设为默认">设默认</button>
+        </div>
+        <div class="cfg-grid">
+          <div class="field">
+            <label>编码</label>
+            <select id="encoding">
+              <option value="utf-8">UTF-8</option>
+              <option value="gbk">GBK</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>读取行数 <label class="inline-chk"><input id="limitEnable" type="checkbox" checked> 启用</label></label>
+            <input id="readLines" type="number" min="0" value="200" placeholder="不限">
+          </div>
+          <div class="field">
+            <label>匹配前/后 N 行</label>
+            <div class="ctx-inputs">
+              <input id="contextBefore" type="number" min="0" value="0" title="前 N 行（grep -B）">
+              <span>/</span>
+              <input id="contextAfter" type="number" min="0" value="0" title="后 N 行（grep -A）">
+            </div>
+          </div>
+          <div class="field switch-group">
+            <label class="switch"><input id="useRegex" type="checkbox"> 正则</label>
+            <label class="switch"><input id="caseSensitive" type="checkbox"> 大小写</label>
+            <label class="switch" id="invertWrap"><input id="invertMatch" type="checkbox"> 反转</label>
+          </div>
+        </div>
+
+        <!-- 普通文本过滤：仅在未勾选"正则"时显示 -->
+        <div class="plain-filter">
+          <label>过滤文本</label>
+          <input id="plainContains" type="text" placeholder="输入要匹配的文本（按字面量匹配）">
+        </div>
+
+        <div class="builder">
+          <div class="builder-head">
+            <span>过滤规则构建器</span>
+            <span class="builder-hint">条件可选，编译为一条正则；自定义正则优先</span>
+          </div>
+          <div class="builder-grid">
+            <div class="builder-row time-row">
+              <label>时间范围</label>
+              <select id="timePrecision" title="时间粒度">
+                <option value="day">按日</option>
+                <option value="hour">按时</option>
+                <option value="minute">按分</option>
+                <option value="second" selected>按秒</option>
+              </select>
+              <!-- 时间范围：flatpickr 日期时间选择器，按粒度切换可选精度 -->
+              <span class="time-inputs">
+                <input id="timeStart" type="text" class="fp-input" placeholder="开始时间" readonly>
+                <span class="tilde">~</span>
+                <input id="timeEnd" type="text" class="fp-input" placeholder="结束时间" readonly>
+              </span>
+              <button id="clearTimeBtn" class="mini-btn" type="button" title="清除时间范围">清除</button>
+            </div>
+            <div class="builder-row">
+              <label>日志级别</label>
+              <div class="level-chips" id="levelChips">
+                <label class="chip"><input type="checkbox" class="level-chk" value="ERROR"> ERROR</label>
+                <label class="chip"><input type="checkbox" class="level-chk" value="WARN"> WARN</label>
+                <label class="chip"><input type="checkbox" class="level-chk" value="INFO"> INFO</label>
+                <label class="chip"><input type="checkbox" class="level-chk" value="DEBUG"> DEBUG</label>
+                <label class="chip"><input type="checkbox" class="level-chk" value="TRACE"> TRACE</label>
+                <label class="chip"><input type="checkbox" class="level-chk" value="FATAL"> FATAL</label>
+              </div>
+            </div>
+            <div class="builder-row two-col">
+              <div class="sub"><label>内容包含</label><input id="contains" type="text" placeholder="如 连接失败"></div>
+              <div class="sub"><label>内容排除</label><input id="exclude" type="text" placeholder="如 DEBUG"></div>
+            </div>
+            <div class="builder-row">
+              <label>自定义正则</label>
+              <input id="customRegex" type="text" placeholder="直接写正则，覆盖上方拼装">
+            </div>
+            <div class="builder-row preview">
+              <label>拼装预览</label>
+              <code id="regexPreview">(无过滤，读取全部)</code>
+            </div>
+          </div>
+        </div>
+
+        <div class="cfg-row highlight-row">
+          <label>高亮关键词</label>
+          <input id="highlightRules" type="text" placeholder="ERROR, WARN, INFO（逗号分隔）">
+        </div>
+      </div>
+    </section>
+
+    <section id="termPanel">
+      <div class="term-toolbar">
+        <span class="panel-title">日志输出</span>
+        <span id="viewInfo" class="view-info"></span>
+        <div class="spacer"></div>
+        <label class="line-num-toggle" title="在终端左侧显示行号"><input type="checkbox" id="lineNumToggle" checked> 行号</label>
+        <button id="pauseBtn" title="暂停/继续数据流">暂停</button>
+        <button id="clearBtn" title="清空终端">清空</button>
+        <button id="copyBtn" title="复制终端选中内容">复制</button>
+        <button id="exportRawBtn" title="导出原始日志文件">导出原始</button>
+        <button id="exportFilterBtn" title="按当前配置导出过滤日志">导出过滤</button>
+      </div>
+      <div class="term-wrap">
+        <div id="gutter"></div>
+        <div id="terminal"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<!-- 导出进度遮罩 -->
+<div id="exportMask" class="export-mask">
+  <div class="export-dialog">
+    <div class="export-title" id="exportTitle">正在导出...</div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="export-meta">
+      <span id="exportStatus">准备中...</span>
+      <span id="exportPercent">0%</span>
+    </div>
+  </div>
+</div>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/fit.js"></script>
+<script src="/static/vendor/flatpickr.js"></script>
+<script src="/static/vendor/flatpickr.zh.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
