@@ -21,6 +21,11 @@ import (
 // 时间戳在日志行中的形态（定长 19 字符，秒级）
 const timeTokenPattern = `[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}`
 
+// awkTimeTokenPattern 是 timeTokenPattern 的 POSIX awk 兼容写法。
+// Debian/Ubuntu 默认的 awk 是 mawk，不支持 {n} 区间量词，因此用显式重复，
+// 否则 match() 永远不匹配，时间过滤会把所有行都丢掉。
+const awkTimeTokenPattern = `[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]`
+
 var timeTokenRe = regexp.MustCompile(timeTokenPattern)
 
 // AssemblePattern 拼装【除时间外】的匹配正则：级别 OR + 内容，用 .* 做 AND。
@@ -84,7 +89,9 @@ func levelRegex(levels []string) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return "(?:" + strings.Join(parts, "|") + ")"
+	// 用普通捕获分组而非 (?:...) 非捕获组：后者是 PCRE 语法，
+	// POSIX ERE（grep -E）不支持，会导致 Linux 下级别正则完全不匹配。
+	return "(" + strings.Join(parts, "|") + ")"
 }
 
 func contentPattern(content string, useRegex bool) string {

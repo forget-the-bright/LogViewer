@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -107,6 +108,8 @@ func (s *Server) handleDownloadFilter(c *gin.Context) {
 	}
 	c.Header("Content-Disposition", `attachment; filename="`+filteredName+`"`)
 	c.Header("Content-Type", "text/plain; charset=utf-8")
-	cmd := cmdbuild.BuildExport(abs, cfg.Encoding, cfg.ReadLinesLimit, f).BuildCmd()
+	exportCmd := cmdbuild.BuildExport(abs, cfg.Encoding, cfg.ReadLinesLimit, f)
+	log.Printf("[export] 过滤导出命令 file=%s shell=%s\n%s", abs, exportCmd.Shell, exportCmd.Script)
+	cmd := exportCmd.BuildCmd()
 	streamCommandToResponse(c, cmd)
 }

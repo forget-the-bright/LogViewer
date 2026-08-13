@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -125,7 +126,10 @@ func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
 	if msg.Config.UseRegex && rule.CustomRegex != "" {
 		f.TimeStart, f.TimeEnd = "", ""
 	}
-	cmd := cmdbuild.BuildView(mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f).BuildCmd()
+	viewCmd := cmdbuild.BuildView(mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f)
+	// 打印实际执行的命令，便于排查各平台命令拼装/过滤不生效问题
+	log.Printf("[ws] 查看命令 mode=%s file=%s shell=%s\n%s", mode, abs, viewCmd.Shell, viewCmd.Script)
+	cmd := viewCmd.BuildCmd()
 
 	procID, err := s.procs.Start(cmd, func(batch string) {
 		s.sendText(cl, `{"type":"log","data":`+jsonQuote(batch)+`}`)

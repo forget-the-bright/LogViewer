@@ -67,11 +67,16 @@ func unixView(mode, filePath, encoding string, limit int, f FilterCfg) string {
 	fq := shQuote(filePath)
 	var base string
 	if mode == "follow" {
-		base = "tail -F"
 		if limit > 0 {
-			base += " -n " + strconv.Itoa(limit)
+			// 指定行数：等价 tail -n N -F
+			base = "tail -F -n " + strconv.Itoa(limit) + " " + fq
+		} else {
+			// 不指定行数：先 cat 输出全部已有内容，再 tail -F -n 0 只跟随新增。
+			// tail -F 不带 -n 时各实现默认行数不一致（有的不回显历史，有的只给末尾 10 行），
+			// 用 cat + tail -F -n 0 两步式保证"先看全量再实时追加"，与 Windows 行为一致。
+			// 用 { ...; } 分组，使两者的 stdout 汇入后面同一条过滤管道。
+			base = "{ cat " + fq + "; tail -F -n 0 " + fq + "; }"
 		}
-		base += " " + fq
 	} else {
 		if limit > 0 {
 			base = "tail -n " + strconv.Itoa(limit) + " " + fq
@@ -95,7 +100,8 @@ func unixView(mode, filePath, encoding string, limit int, f FilterCfg) string {
 // 匹配到时间戳的行按字典序比较；未带时间戳的行（堆栈续行）沿用上一行的判定。
 func unixTimeStage(start, end string, lineBuffered bool) string {
 	// 用 -v 传参，避免注入；fflush 保证 follow 模式实时输出。
-	prog := `{ if (match($0, /` + timeTokenPattern + `/)) { t=substr($0,RSTART,RLENGTH); keep=(t>=s && t<=e) } if (keep) print`
+	// 注意：正则必须用 awk 兼容写法（awkTimeTokenPattern），mawk 不支持 {n} 区间量词。
+	prog := `{ if (match($0, /` + awkTimeTokenPattern + `/)) { t=substr($0,RSTART,RLENGTH); keep=(t>=s && t<=e) } if (keep) print`
 	if lineBuffered {
 		prog += `; fflush()`
 	}

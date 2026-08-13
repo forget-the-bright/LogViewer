@@ -7,9 +7,19 @@
 
 ### Unix
 
-- 跟踪：`tail -F [-n N] <file>`（`-F` 跟 inode，文件被轮转/重建后自动重连）
+- 跟踪且指定行数 N：`tail -F -n N <file>`（`-F` 跟 inode，文件被轮转/重建后自动重连）
+- 跟踪且不指定行数：**两步式**
+  ```sh
+  { cat <file>; tail -F -n 0 <file>; }
+  ```
+  先 `cat` 输出全部已有内容，再 `tail -F -n 0` 只跟随新增。
+  不能直接 `tail -F <file>`：不带 `-n` 时各实现默认行数不一致（有的不回显历史、
+  有的只给末尾 10 行），会出现"跟踪但一直不返回历史"的现象。用 `{ ...; }` 分组，
+  两条命令的 stdout 汇入后面同一条过滤管道。
 - 静态全量：`cat <file>`
 - 静态末 N 行：`tail -n N <file>`
+
+> 停止跟踪时 Unix 用独立进程组 `Kill(-pgid, SIGKILL)`，`cat`/`tail`/`grep` 整条管道一起杀，不留残留。
 
 ### Windows
 
@@ -81,10 +91,17 @@ ISO 时间戳 `YYYY-MM-DD HH:MM:SS` 是**定长 19 字符**，字典序与时间
 
 级别和内容由 `AssemblePattern` 拼成一条正则交给 `grep -E` / `Select-String`：
 
-- 多个级别用 `|` 做 OR：`(?:ERROR|WARN)`；
+- 多个级别用 `|` 做 OR：`(ERROR|WARN)`；
 - 级别和内容之间用 `.*` 连接，表示 AND；
 - 普通文本模式下内容用 `regexp.QuoteMeta` 转义成字面量；
 - 自定义正则（仅在勾选"正则"时生效）优先级最高，直接整条使用，并跳过时间阶段。
+
+**跨平台正则方言注意**：Unix 用的是 `grep -E`（POSIX ERE）和 `awk`，
+与 .NET / PCRE 语法有差异，拼装时必须用三家都支持的子集：
+
+- **不能用 `(?:...)` 非捕获组**，那是 PCRE 语法，ERE 不支持，会导致 Linux 下整条正则不匹配。用普通捕获分组 `(...)`（捕获本身无副作用）。
+- **awk（尤其 Debian/Ubuntu 默认的 mawk）不支持 `{n}` 区间量词**。时间戳正则在 awk 阶段用显式重复 `[0-9][0-9][0-9][0-9]-...`；Go 的 `regexp` 和 PowerShell 仍可用 `{4}`。
+- 用户在"自定义正则"框里输入的内容会原样传给 `grep -E`，需自行保证是 ERE 兼容语法。
 
 ### Unix 管道
 

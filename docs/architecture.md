@@ -42,7 +42,7 @@ internal/
 
 | 场景        | Unix                                   | Windows                                          |
 | ----------- | -------------------------------------- | ------------------------------------------------ |
-| 实时跟踪    | `tail -F [-n N] file`                  | `Get-Content -Wait -Tail N`（两步式，见下）       |
+| 实时跟踪    | 指定行 `tail -F -n N file`；不指定 `{ cat file; tail -F -n 0 file; }` | `Get-Content -Wait -Tail N`（见下）       |
 | 静态全量    | `cat file`                             | `[IO.File]::ReadLines(path, enc)`                |
 | 静态末 N 行 | `tail -n N file`                       | `Get-Content -Tail N`                            |
 | GBK 解码    | `iconv -f GBK -t UTF-8`                | `-Encoding OEM` / `.NET GetEncoding('GBK')`      |
@@ -50,13 +50,14 @@ internal/
 | 内容过滤    | `grep -E` / `grep -v -F`（line-buffered） | `Select-String` / `-NotMatch -SimpleMatch`    |
 | 上下文      | `grep -B N -A N`                       | `Select-String -Context B,A`                     |
 
-**Windows 一步式跟踪**：当指定了 `limit`，命令是
+**Windows 跟踪**：当指定了 `limit`，命令是
 
 ```powershell
-& { Get-Content <file> -Wait  -Tail N }
+& { Get-Content <file> -Wait -Tail N }
 ```
 
-这等价于 `tail -n N -F`。
+不指定行数时用 `Get-Content -Wait`。Unix 不指定行数时用 `{ cat; tail -F -n 0; }`
+两步式，保证先输出全量历史再跟随新增。
 
 ### procmgr —— 进程与流读取
 

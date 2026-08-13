@@ -13,12 +13,12 @@ func TestAssemblePattern(t *testing.T) {
 		Levels:  []string{"ERROR", "WARN"},
 		Content: "连接失败",
 	}, false)
-	want := `(?:ERROR|WARN).*连接失败`
+	want := `(ERROR|WARN).*连接失败`
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
 	// 仅级别
-	if g := AssemblePattern(config.FilterRule{Levels: []string{"ERROR"}}, false); g != "(?:ERROR)" {
+	if g := AssemblePattern(config.FilterRule{Levels: []string{"ERROR"}}, false); g != "(ERROR)" {
 		t.Errorf("level only: %q", g)
 	}
 	// 仅内容（字面量转义）
@@ -34,7 +34,7 @@ func TestAssemblePattern(t *testing.T) {
 		t.Errorf("custom priority: %q", g)
 	}
 	// 普通文本模式忽略自定义正则，按字面量内容匹配
-	if g := AssemblePattern(config.FilterRule{Levels: []string{"ERROR"}, Content: "x", CustomRegex: "^CUSTOM"}, false); g != "(?:ERROR).*x" {
+	if g := AssemblePattern(config.FilterRule{Levels: []string{"ERROR"}, Content: "x", CustomRegex: "^CUSTOM"}, false); g != "(ERROR).*x" {
 		t.Errorf("plain mode ignores custom: %q", g)
 	}
 	// 空规则

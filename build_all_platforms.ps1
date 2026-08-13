@@ -5,8 +5,8 @@ Go 跨平台一键编译打包脚本 - LogViewer 日志查看工具
 
 # ===================== 配置区（按需修改） =====================
 $ProjectName = "logviewer"
-$Version = "v1.0.0"
-# 程序入口文件，main.go 所在相对路径
+$Version = "v0.0.1"
+# main.go 在项目根目录
 $MainPath = "."
 # 输出目录
 $DistDir = "./dist"
@@ -25,8 +25,36 @@ $targets = @(
 # ============================================================
 
 Write-Host "===== 开始清理旧构建产物 =====" -ForegroundColor Cyan
-if (Test-Path $DistDir) { Remove-Item $DistDir -Recurse -Force }
-if (Test-Path $BuildTmpDir) { Remove-Item $BuildTmpDir -Recurse -Force }
+# 优先杀掉正在运行的logviewer进程，释放文件锁
+Get-Process -Name $ProjectName -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 200
+
+# 容错删除目录
+if (Test-Path $DistDir) {
+    try {
+        Remove-Item $DistDir -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "⚠️ dist目录无法完整删除(文件占用)，尝试清空内部文件继续"
+        Get-ChildItem $DistDir -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $_ | Remove-Item -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "跳过锁定文件：$($_.FullName)"
+            }
+        }
+    }
+}
+if (Test-Path $BuildTmpDir) {
+    try {
+        Remove-Item $BuildTmpDir -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "⚠️ .build_tmp 删除失败，忽略继续构建"
+    }
+}
+
 New-Item -Path $DistDir,$BuildTmpDir -ItemType Directory -Force | Out-Null
 
 Write-Host "===== 开始跨平台编译 $ProjectName $Version =====" -ForegroundColor Cyan
@@ -45,7 +73,7 @@ foreach ($t in $targets) {
 
     Write-Host "`n[编译] $goos/$goarch -> $binName" -ForegroundColor Green
 
-    # 设置环境变量并执行编译
+    # 设置交叉编译环境变量
     $env:GOOS = $goos
     $env:GOARCH = $goarch
     go build -ldflags "-s -w -X main.version=$Version" -o "$binOutputPath" $MainPath
@@ -63,15 +91,17 @@ foreach ($t in $targets) {
         Compress-Archive -Path "$tmpOutputDir/*" -DestinationPath $archivePath -Force
     }
     elseif ($archiveType -eq "tar.gz") {
-        # PowerShell 内置没有tar，调用 tar.exe (Windows10+/Git Bash/WSL自带)
+        # 修复tar跨目录打开失败问题：先在临时目录打包，再移动
+        $localTar = "${ProjectName}-${Version}-${goos}-${goarch}.tar.gz"
         Push-Location $tmpOutputDir
-        tar -czf "$archivePath" *
+        tar -czf $localTar *
         Pop-Location
+        Move-Item -Path (Join-Path $tmpOutputDir $localTar) -Destination $archivePath -Force
     }
 
     Write-Host "✅ 输出包：$archiveName" -ForegroundColor Green
 }
 
-# 清理临时目录
-Remove-Item $BuildTmpDir -Recurse -Force
+# 清理临时目录，允许失败不报错
+Remove-Item $BuildTmpDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`n===== 全部编译打包完成，产物目录：$DistDir =====" -ForegroundColor Cyan
