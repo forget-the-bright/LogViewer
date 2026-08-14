@@ -52,20 +52,26 @@ logviewer.exe -addr 127.0.0.1:8080 -dir "D:\logs,C:\tomcat\logs"
 
 ### 参数
 
-| 参数    | 说明                                                                 |
-| ------- | -------------------------------------------------------------------- |
-| `-addr` | 监听地址，默认 `:8080`                                               |
-| `-dir`  | 允许浏览的根目录，逗号或分号分隔；为空时用进程当前工作目录           |
+| 参数               | 说明                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| `-addr`            | 监听地址，默认 `:8080`（覆盖 logviewer.json 中的 addr）              |
+| `-dir`             | 允许浏览的根目录，逗号或分号分隔；合并到本机 local 的 dirs 并去重    |
+| `-config`          | 显式指定配置文件路径                                                 |
+| `-hash-password`   | 生成 bcrypt 密码哈希后退出（用于配置 auth.password）                 |
 
 ### 运行时生成的文件
 
-程序启动后，会在**可执行文件所在目录**下创建：
+程序启动后，会在**可执行文件所在目录**下查找/生成：
 
 ```
-config/configs.json     # 用户保存的过滤配置
+logviewer.json     # 全部配置：监听地址、认证、机器列表、扫描目录、过滤预设
 ```
 
-这个文件可以备份、随安装包一起分发；删除它会在下次启动时重建默认配置。
+查找顺序：`-config` 指定路径 → `<exe>/logviewer.json` → `<cwd>/logviewer.json`；
+都不存在时在 `<exe>` 目录生成带注释的模板。文件权限 `0600`（含密码）。
+
+旧版的 `config/configs.json` 会在首次启动时自动迁移到 `logviewer.json`，
+旧文件备份为 `configs.json.bak`。
 
 ## 3. 平台依赖
 
@@ -75,8 +81,9 @@ config/configs.json     # 用户保存的过滤配置
 | macOS         | 同上（系统自带 BSD 版本）                                                 |
 | Windows       | PowerShell（Windows 7+ / Server 2008 R2+ 自带）                           |
 
-Windows 上整条命令管道在单个 powershell 进程内执行，因此停止时杀掉 powershell
-就会终止整条管道，不会留下孤立的 `Get-Content`。
+Windows 上整条命令管道在单个 powershell 进程内执行，停止时会用 `taskkill /T /F`
+终止整个进程树，不会留下孤立的 `Get-Content`。受 Windows OpenSSH 通道关闭机制影响，
+远程 Windows 停止可能有 ~1s 的回收延迟（不影响后续操作，界面会显示"停止中"loading）。
 
 ## 4. 作为后台服务运行
 
@@ -109,9 +116,42 @@ sudo systemctl enable --now logviewer
 用任务计划程序"登录时启动"或 [NSSM](https://nssm.cc/) 把 `logviewer.exe` 注册成服务。
 注意 `-dir` 要指定能读到日志的绝对路径。
 
-## 5. 反向代理与远程访问
+## 5. 登录认证
 
-程序没有内置认证，默认建议只监听 `127.0.0.1`。需要多人访问时，放在带认证的反向代理后。
+默认 `auth.enabled=false`，**完全不做登录校验**，适合只监听本机回环的个人使用。
+若要绑定到非本机地址或放在网络中，建议启用内置登录：
+
+1. 生成密码哈希：
+   ```bash
+   ./logviewer -hash-password 'your-password'
+   # 输出形如 $2a$10$xxxxxxxx...
+   ```
+2. 在 `logviewer.json` 中填写（明文密码也能用但启动会有警告，不推荐）：
+   ```json
+   "auth": {
+     "enabled": true,
+     "username": "admin",
+     "password": "$2a$10$xxxxxxxx...",
+     "session_ttl_minutes": 720
+   }
+   ```
+3. 重启后浏览器会出现登录遮罩，登录后凭 `HttpOnly; SameSite=Lax` 会话 Cookie
+   访问（HTTPS 下自动加 `Secure`）。
+
+实现要点：
+
+- 会话 token 为 32 字节随机值（crypto/rand + base64url），仅存内存，重启失效；
+  每次请求滑动续期，超过 `session_ttl_minutes` 无活动自动过期。
+- 登录失败统一等待约 1 秒并按 IP 限流：60 秒内连续失败 5 次会短暂锁定，
+  即使密码正确也拒绝，避免用户名枚举与爆破。
+- WebSocket 在启用认证时校验会话 Cookie，并做 Origin 同源校验（仅比较 host，
+  允许本地 http/ws 混用），防止跨站 WS 劫持。
+- 登出立即失效服务端会话。
+
+## 6. 反向代理与远程访问
+
+默认建议只监听 `127.0.0.1`。启用上一节的内置登录后可直接绑定到内网地址；
+需要多人访问、TLS 终止或更复杂鉴权时，也可放在反向代理之后。
 
 Nginx 示例（注意要支持 WebSocket）：
 
@@ -126,14 +166,14 @@ location / {
 }
 ```
 
-## 6. 升级
+## 7. 升级
 
 1. 停止旧进程（systemd: `systemctl stop logviewer`）；
 2. 用新二进制覆盖；
-3. 启动。`config/configs.json` 向前兼容，新增字段会在保存时补齐，旧配置不受影响。
+3. 启动。`logviewer.json` 向前兼容，新增字段会在保存时补齐，旧配置不受影响。
 
-## 7. 安全建议
+## 8. 安全建议
 
-- 不要把 `-addr` 直接暴露在公网；走反向代理并加鉴权。
+- 不要把 `-addr` 直接暴露在公网；启用内置登录或走反向代理并加鉴权。
 - `-dir` 只授予需要查看的日志目录最小权限，不要给整个磁盘根目录。
 - 运行账号对日志目录保持只读即可，程序本身不写日志文件。

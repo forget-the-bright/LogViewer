@@ -38,12 +38,15 @@ Windows 下一键全平台打包：
 
 | 你想改什么                 | 去哪                                                   |
 | -------------------------- | ------------------------------------------------------ |
-| 命令在各平台怎么拼         | `internal/cmdbuild/cmdbuild.go`                        |
+| logviewer.json 结构/加载   | `internal/appconfig/`                                  |
+| 机器抽象 / 本机实现 / 路径校验 | `internal/host/`                                   |
+| 命令在各平台怎么拼         | `internal/cmdbuild/cmdbuild.go`（platform 由 Host 传入） |
 | 过滤正则 / 时间区间算法    | `internal/cmdbuild/filter.go`                          |
 | 子进程读取 / 节流 / 查杀   | `internal/procmgr/procmgr.go` + `procsys_*.go`         |
-| 配置字段与默认值           | `internal/config/config.go`                            |
+| 配置字段与预设 CRUD        | `internal/config/config.go`                            |
+| HTTP 路由 / 机器分发       | `internal/server/server.go`                            |
 | WebSocket 协议 / 会话流程  | `internal/server/ws.go`                                |
-| 目录浏览 / 路径校验        | `internal/server/dir.go`                               |
+| 目录浏览 API               | `internal/server/dir.go`（走 Host.Ls/ResolvePath）     |
 | 导出                       | `internal/server/export.go`                            |
 | 启动参数 / embed           | `main.go`                                              |
 | 前端所有交互               | `static/app.js`、`static/index.html`、`static/style.css` |

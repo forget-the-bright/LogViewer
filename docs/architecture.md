@@ -24,11 +24,44 @@
 
 ```
 internal/
+├── appconfig/  # logviewer.json 加载(JSONC)、默认模板生成、旧配置迁移、密码哈希
+├── host/       # 机器抽象：Host 接口 + LocalHost（本机 os/exec）+ SSHHost（SSH/SFTP + 远程命令）
 ├── cmdbuild/   # 把 LogConfig 翻译成各平台的命令脚本（纯字符串构建，无副作用）
 ├── procmgr/    # 子进程的启动、stdout/stderr 读取、节流批量、进程组查杀
-├── config/     # LogConfig 结构 + configs.json 的 CRUD 持久化
-└── server/     # Gin 路由：目录、配置 API、导出、WebSocket
+├── config/     # LogConfig 结构 + 预设 CRUD（内存 + SaveFunc 持久化钩子）
+└── server/     # Gin 路由：机器列表、目录、配置 API、导出、WebSocket
 ```
+
+### host —— 机器抽象
+
+server 层不直接调用 `os.*` / `exec.*` / `runtime.GOOS`，而是通过 `Host` 接口：
+
+- `Name() / Platform() / Dirs() / Configs() / Capabilities()`
+- `ResolvePath(p)` —— 路径穿越校验（含符号链接逃逸检测）
+- `Ls / Stat / Open` —— 目录浏览与文件读取
+- `Run(cmdbuild.Command)` —— 返回 `procmgr.Process`，由 procmgr 统一管控
+
+`LocalHost` 是本机实现。`SSHHost` 通过 SSH+SFTP 访问远程机器：密码认证、known_hosts
+TOFU（首次落盘，之后严格校验）、`uname -s`/`cmd /c ver` 自动探测平台、keepalive 保活与
+断线重连。远程路径校验不依赖本机 `filepath`，而是按目标平台分隔符做词法清洗 + SFTP
+`RealPath` 解析符号链接，防止跨平台路径穿越与软链逃逸。
+
+远程命令执行由 `sshProc` 实现（`internal/host/ssh_proc.go`）：把 cmdbuild 生成的脚本
+包成 `sh -c '<script>'`（Unix）或 `powershell -NoProfile -NonInteractive -EncodedCommand
+<b64>`（Windows，UTF-16LE base64 绕过 cmd 引号问题），在 SSH session 上启动，stdout/stderr
+交给 procmgr 同一套读取/节流逻辑。远端进程树查杀靠 **PID 标记**：脚本开头向 stderr 打印
+`LV_PID=<pid>`（Unix 用 `printf '%s' "$"`，Windows 用 `$PID`），`pidFilterReader`
+拦截首行解析出 PID，停止时另开一条 SSH 连接执行整组查杀（Unix `kill -KILL -<pgid>`，
+Windows `taskkill /T /F /PID`），再关闭当前 session，避免 OpenSSH 信号不可靠导致
+tail/grep 残留。
+
+`Capabilities()` 返回远端是否具备 `tail/cat/grep/awk/iconv`（连接时批量
+`command -v` 探测；Windows 恒为 true）。最小化容器可能缺 `iconv`/`awk`，服务端
+`checkCaps` 在构建命令前拦截并返回可读错误，前端据 `/api/h/:host/capabilities`
+禁用 GBK 选项（需 iconv）和时间范围过滤（需 awk）。
+
+业务路由统一加 `/api/h/:host/` 前缀，WebSocket 连 `/ws?host=<alias>`，为本机和远程
+共用同一套逻辑。
 
 ### cmdbuild —— 命令构建
 
@@ -61,7 +94,8 @@ internal/
 
 ### procmgr —— 进程与流读取
 
-- `Start(cmd, outFn, errFn, doneFn)` 启动进程，开启三个 goroutine：
+- `Start(proc, outFn, errFn, doneFn)` 启动一个实现了 `Process` 接口的进程
+  （本机 `localProc` 包装 `*exec.Cmd`；远程 `sshProc` 包装 `*ssh.Session`），开启三个 goroutine：
   - stdout 读取协程：按行读 + **独立定时协程节流批量**（默认 40ms 或满 512 行
     flush 一次），避免高频日志产生 WebSocket 消息风暴。
   - stderr 读取协程：逐行回调 `errFn`。
@@ -80,12 +114,14 @@ internal/
 
 ### server —— HTTP / WebSocket
 
-- 目录浏览：`/api/dir/roots`、`/api/dir/list?path=`，懒加载单层节点，
+- 机器列表：`GET /api/hosts`（别名、平台、在线状态，供顶栏切换器）。
+- 能力探测：`GET /api/h/:host/capabilities`。
+- 目录浏览：`/api/h/:host/dir/roots`、`/api/h/:host/dir/list?path=`，懒加载单层节点，
   只展示目录和 `.log`/`.out` 文件。
-- 配置 CRUD：`/api/config/list|get|save|delete|rename|setdefault|preview`。
-- 导出：`GET /api/file/download/origin`（原始字节，带 `Content-Length`）、
-  `POST /api/file/download/filter`（按当前表单过滤，流式输出）。
-- WebSocket：`/ws`，上行 `start`/`stop`/`ping`，下行 `log`/`error`/`status`。
+- 配置 CRUD：`/api/h/:host/config/list|get|save|delete|rename|setdefault|preview`，每台机器独立预设。
+- 导出：`GET /api/h/:host/file/download/origin`（原始字节，带 `Content-Length`）、
+  `POST /api/h/:host/file/download/filter`（按当前表单过滤，流式输出）。
+- WebSocket：`/ws?host=<alias>`，上行 `start`/`stop`/`ping`，下行 `log`/`error`/`status`。
 
 ## 请求流（一次实时跟踪）
 
@@ -118,8 +154,25 @@ internal/
 
 ## 安全边界
 
-- **根目录限制**：服务维护允许访问的根目录列表（`-dir` 指定），任何文件请求都经过
-  `resolveAndCheck`：`Abs` → `Clean` → 对每个 root 做 `Rel`，跳出根目录一律拒绝。
+- **根目录限制**：每个 Host 维护允许访问的根目录列表（来自 `logviewer.json` 的 `dirs`
+  与 `-dir` 合并），任何文件请求都经过 `ResolvePath`：`Abs` → `Clean` → 对每个 root
+  做 `Rel`，跳出根目录一律拒绝。不能用字符串前缀判断（`/root` 会被 `/root-evil` 绕过）。
+- **符号链接逃逸检测**：`ResolvePath` 对路径做 `EvalSymlinks`（文件不存在时退化到父目录），
+  解析出的真实路径若跳出根目录也拒绝，防止 root 内软链指向外部敏感文件。
 - **命令注入防护**：文件路径和模式串用平台专属引号转义（Unix `'...'` + `'\''`，
-  PowerShell `'...'` + `''`），通过 `-Command` / `sh -c` 的参数位传入。
-- 默认只监听本机地址；需要远程访问时应放在带认证的反向代理之后。
+  Windows 用 `-EncodedCommand` 传 UTF-16LE base64，完全绕过 cmd/PowerShell 引号转义），
+  不经由字符串拼接进 shell。
+- **登录认证（可选）**：`auth.enabled=true` 时，除 `/api/login`、`/api/auth/status`
+  外的所有 `/api/**` 都要过会话中间件，WebSocket 在 Upgrade 前校验 Cookie 并做同源校验。
+  会话 token 用 crypto/rand 生成、仅存内存、滑动续期；登录按 IP 限流（60 秒 5 次）。
+  默认关闭，关闭时不做任何登录校验。
+- 默认只监听本机地址；绑定非本机地址且未启用认证时，启动会打印安全警告。
+
+## 优雅关闭
+
+收到 SIGINT / SIGTERM 后：
+
+1. `http.Server.Shutdown` 停止接收新连接、等待进行中的 HTTP 请求结束（5 秒超时）；
+2. `Server.Close()` 先 `procmgr.StopAll()` 杀掉所有正在运行的日志进程（远程连同进程组
+   一起查杀，避免 tail/管道孤儿），再 `host.Manager.Close()` 关闭所有 SSH 客户端与
+   keepalive。顺序很重要：必须先杀进程再断 SSH，否则查杀命令发不出去。

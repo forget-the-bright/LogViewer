@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -12,20 +13,16 @@ import (
 
 	"logviewer/internal/cmdbuild"
 	"logviewer/internal/config"
+	"logviewer/internal/host"
 )
 
-// wsClient 每个连接的状态：写锁 + 当前子进程
+// wsClient 每个连接的状态：写锁 + 当前子进程 + 所属机器
 type wsClient struct {
 	conn   *websocket.Conn
 	wmu    sync.Mutex
+	host   host.Host
 	procID uint64
 }
-
-// 连接 -> 客户端状态
-var (
-	clientsMu sync.Mutex
-	clients   = map[*websocket.Conn]*wsClient{}
-)
 
 // wsMessage 上行指令
 type wsMessage struct {
@@ -34,27 +31,34 @@ type wsMessage struct {
 	Config   config.LogConfig `json:"config"`
 }
 
-// handleWS 处理 WebSocket 连接
+// handleWS 处理 WebSocket 连接。host 通过 query 参数 ?host= 指定。
 func (s *Server) handleWS(c *gin.Context) {
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	// WebSocket 不能走普通 JSON 中间件，这里在 Upgrade 前显式校验会话 cookie。
+	if s.auth.Enabled() {
+		ck, err := c.Cookie(sessionCookie)
+		if err != nil || !s.auth.validate(ck) {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+	}
+	h, err := s.hosts.Get(c.Query("host"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	upg := s.upgrader()
+	conn, err := upg.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
-	cl := &wsClient{conn: conn}
-	clientsMu.Lock()
-	clients[conn] = cl
-	clientsMu.Unlock()
+	cl := &wsClient{conn: conn, host: h}
 
-	// 连接断开：销毁该连接绑定的命令进程，防止残留
 	defer func() {
 		s.stopSession(cl)
-		clientsMu.Lock()
-		delete(clients, conn)
-		clientsMu.Unlock()
 		conn.Close()
 	}()
 
-	conn.SetReadLimit(1 << 20) // 1MB
+	conn.SetReadLimit(1 << 20)
 	conn.SetReadDeadline(time.Time{})
 
 	for {
@@ -80,25 +84,23 @@ func (s *Server) handleWS(c *gin.Context) {
 }
 
 // startSession 启动一次日志查看：构建系统原生命令管道并托管其进程。
-// 静态加载与实时跟踪都走命令，Go 只做转发（纯外壳）。
 func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
-	// 先停掉旧进程
 	s.stopSession(cl)
+	h := cl.host
 
-	abs, err := s.resolveAndCheck(msg.FilePath)
+	abs, err := h.ResolvePath(msg.FilePath)
 	if err != nil {
 		s.sendError(cl, err.Error())
 		return
 	}
 
-	// 文件预检
-	info, err := os.Stat(abs)
-	missing := os.IsNotExist(err)
+	// 文件预检（跟踪模式允许文件暂不存在）
+	info, statErr := h.Stat(abs)
+	missing := os.IsNotExist(statErr)
 	if missing && msg.Config.FollowTail {
-		// 跟踪模式允许文件暂不存在（tail -F / Get-Content -Wait 会等待）
 		s.sendStatus(cl, "waiting")
-	} else if err != nil {
-		s.sendError(cl, "无法访问文件: "+err.Error())
+	} else if statErr != nil {
+		s.sendError(cl, "无法访问文件: "+statErr.Error())
 		return
 	} else if info != nil && info.IsDir() {
 		s.sendError(cl, "所选为目录，请选择日志文件")
@@ -112,26 +114,33 @@ func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
 	rule := msg.Config.FilterRule
 	ts, te, _ := cmdbuild.TimeBounds(rule)
 	f := cmdbuild.FilterCfg{
-		Pattern:        cmdbuild.AssemblePattern(rule, msg.Config.UseRegex),
-		Exclude:        rule.Exclude,
-		TimeStart:      ts,
-		TimeEnd:        te,
-		UseRegex:       msg.Config.UseRegex,
-		CaseSensitive:  msg.Config.CaseSensitive,
-		InvertMatch:    msg.Config.InvertMatch,
-		ContextBefore:  msg.Config.ContextBefore,
-		ContextAfter:   msg.Config.ContextAfter,
+		Pattern:       cmdbuild.AssemblePattern(rule, msg.Config.UseRegex),
+		Exclude:       rule.Exclude,
+		TimeStart:     ts,
+		TimeEnd:       te,
+		UseRegex:      msg.Config.UseRegex,
+		CaseSensitive: msg.Config.CaseSensitive,
+		InvertMatch:   msg.Config.InvertMatch,
+		ContextBefore: msg.Config.ContextBefore,
+		ContextAfter:  msg.Config.ContextAfter,
 	}
 	// 自定义正则仅在勾选"正则"时生效，并覆盖时间阶段
 	if msg.Config.UseRegex && rule.CustomRegex != "" {
 		f.TimeStart, f.TimeEnd = "", ""
 	}
-	viewCmd := cmdbuild.BuildView(mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f)
-	// 打印实际执行的命令，便于排查各平台命令拼装/过滤不生效问题
-	log.Printf("[ws] 查看命令 mode=%s file=%s shell=%s\n%s", mode, abs, viewCmd.Shell, viewCmd.Script)
-	cmd := viewCmd.BuildCmd()
+	if msgErr := checkCaps(h, msg.Config.Encoding, f.TimeStart != "" || f.TimeEnd != ""); msgErr != "" {
+		s.sendError(cl, msgErr)
+		return
+	}
+	viewCmd := cmdbuild.BuildView(h.Platform(), mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f)
+	log.Printf("[ws] host=%s mode=%s file=%s shell=%s", h.Name(), mode, baseName(abs), viewCmd.Shell)
+	proc, err := h.Run(viewCmd)
+	if err != nil {
+		s.sendError(cl, "启动命令失败: "+err.Error())
+		return
+	}
 
-	procID, err := s.procs.Start(cmd, func(batch string) {
+	procID, err := s.procs.Start(proc, func(batch string) {
 		s.sendText(cl, `{"type":"log","data":`+jsonQuote(batch)+`}`)
 	}, func(errLine string) {
 		s.sendError(cl, trimLine(errLine))
@@ -183,3 +192,4 @@ func trimLine(s string) string {
 	}
 	return s
 }
+

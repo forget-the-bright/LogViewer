@@ -2,7 +2,6 @@ package cmdbuild
 
 import (
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -11,9 +10,14 @@ import (
 // 设计原则：Go 只做"外壳"，所有日志读取与过滤都由系统原生命令完成
 // （Linux/macOS: tail/cat + awk + grep；Windows: Get-Content + Where-Object + Select-String）。
 // 时间范围用字符串比较（awk/PowerShell），不用正则枚举，命令长度恒定。
+//
+// Platform 为目标平台 "linux"/"darwin"/"windows"，决定用 sh 还是 powershell。
+// 本机执行时取 runtime.GOOS；远程 SSH 执行时取远程探测到的平台，因此不能在
+// 构建期写死 runtime.GOOS。
 type Command struct {
-	Shell  string // "sh" 或 "powershell"
-	Script string // 命令管道脚本
+	Platform string
+	Shell    string // "sh" 或 "powershell"
+	Script   string // 命令管道脚本
 }
 
 // FilterCfg 过滤参数（由前端 LogConfig 映射而来）。
@@ -30,7 +34,7 @@ type FilterCfg struct {
 	ContextAfter  int  // 匹配行后 N 行
 }
 
-// BuildCmd 将 Command 转成 *exec.Cmd
+// BuildCmd 将 Command 转成 *exec.Cmd（本机执行用）。
 func (c Command) BuildCmd() *exec.Cmd {
 	if c.Shell == "powershell" {
 		return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", c.Script)
@@ -39,26 +43,17 @@ func (c Command) BuildCmd() *exec.Cmd {
 }
 
 // BuildView 构造一次"查看"命令（静态加载或实时跟踪）。
-func BuildView(mode, filePath, encoding string, limit int, f FilterCfg) Command {
-	if runtime.GOOS == "windows" {
-		return Command{Shell: "powershell", Script: windowsView(mode, filePath, encoding, limit, f)}
+// platform 为目标平台："linux"/"darwin" 走 Unix 命令，"windows" 走 PowerShell。
+func BuildView(platform, mode, filePath, encoding string, limit int, f FilterCfg) Command {
+	if platform == "windows" {
+		return Command{Platform: platform, Shell: "powershell", Script: windowsView(mode, filePath, encoding, limit, f)}
 	}
-	return Command{Shell: "sh", Script: unixView(mode, filePath, encoding, limit, f)}
-}
-
-// BuildOrigin 构造"导出原始文件"命令（字节级原样输出）。
-func BuildOrigin(filePath string) Command {
-	if runtime.GOOS == "windows" {
-		script := `$c=[IO.File]::OpenRead(` + psQuote(filePath) + `);` +
-			`try{$c.CopyTo([Console]::OpenStandardOutput())}finally{$c.Close()}`
-		return Command{Shell: "powershell", Script: script}
-	}
-	return Command{Shell: "sh", Script: "cat " + shQuote(filePath)}
+	return Command{Platform: platform, Shell: "sh", Script: unixView(mode, filePath, encoding, limit, f)}
 }
 
 // BuildExport 构造"导出过滤日志"命令。
-func BuildExport(filePath, encoding string, limit int, f FilterCfg) Command {
-	return BuildView("static", filePath, encoding, limit, f)
+func BuildExport(platform, filePath, encoding string, limit int, f FilterCfg) Command {
+	return BuildView(platform, "static", filePath, encoding, limit, f)
 }
 
 // ---- Unix (Linux/macOS) ----

@@ -10,7 +10,6 @@ import (
 )
 
 // handleConfigPreview 返回时间范围与匹配正则的可读拼装（用于前端实时预览）。
-// 时间范围由命令按字符串比较处理，不计入正则，保证正则短而清晰。
 func (s *Server) handleConfigPreview(c *gin.Context) {
 	var req struct {
 		FilterRule config.FilterRule `json:"FilterRule"`
@@ -21,7 +20,6 @@ func (s *Server) handleConfigPreview(c *gin.Context) {
 		return
 	}
 	var timeDesc, pattern string
-	// 自定义正则仅在"正则"勾选时生效；普通文本模式走拼装（内容按字面量）
 	if req.UseRegex && req.FilterRule.CustomRegex != "" {
 		pattern = req.FilterRule.CustomRegex
 	} else {
@@ -40,41 +38,56 @@ func (s *Server) handleConfigPreview(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"pattern": pattern, "timeRange": timeDesc})
 }
 
-// handleConfigList 返回所有配置名
 func (s *Server) handleConfigList(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"names": s.cfg.List(), "default": s.cfg.GetDefault().ConfigName})
-}
-
-// handleConfigGet 返回指定配置
-func (s *Server) handleConfigGet(c *gin.Context) {
-	name := c.Query("name")
-	if name == "" {
-		c.JSON(http.StatusOK, s.cfg.GetDefault())
+	h, ok := s.hostFrom(c)
+	if !ok {
 		return
 	}
-	if cfg, ok := s.cfg.Get(name); ok {
+	mgr := h.Configs()
+	c.JSON(http.StatusOK, gin.H{"names": mgr.List(), "default": mgr.GetDefault().ConfigName})
+}
+
+func (s *Server) handleConfigGet(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
+	mgr := h.Configs()
+	name := c.Query("name")
+	if name == "" {
+		c.JSON(http.StatusOK, mgr.GetDefault())
+		return
+	}
+	if cfg, ok := mgr.Get(name); ok {
 		c.JSON(http.StatusOK, cfg)
 		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "配置不存在: " + name})
 }
 
-// handleConfigSave 保存（新增或覆盖）
 func (s *Server) handleConfigSave(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
 	var cfg config.LogConfig
 	if err := c.ShouldBindJSON(&cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: " + err.Error()})
 		return
 	}
-	if err := s.cfg.Save(cfg); err != nil {
+	if err := h.Configs().Save(cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "names": s.cfg.List(), "default": s.cfg.GetDefault().ConfigName})
+	mgr := h.Configs()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "names": mgr.List(), "default": mgr.GetDefault().ConfigName})
 }
 
-// handleConfigDelete 删除配置
 func (s *Server) handleConfigDelete(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
 	var req struct {
 		Name string `json:"name"`
 	}
@@ -82,15 +95,19 @@ func (s *Server) handleConfigDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少配置名"})
 		return
 	}
-	if err := s.cfg.Delete(req.Name); err != nil {
+	if err := h.Configs().Delete(req.Name); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "names": s.cfg.List(), "default": s.cfg.GetDefault().ConfigName})
+	mgr := h.Configs()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "names": mgr.List(), "default": mgr.GetDefault().ConfigName})
 }
 
-// handleConfigRename 重命名
 func (s *Server) handleConfigRename(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
 	var req struct {
 		Old string `json:"old"`
 		New string `json:"new"`
@@ -99,15 +116,19 @@ func (s *Server) handleConfigRename(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少配置名"})
 		return
 	}
-	if err := s.cfg.Rename(req.Old, req.New); err != nil {
+	if err := h.Configs().Rename(req.Old, req.New); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "names": s.cfg.List(), "default": s.cfg.GetDefault().ConfigName})
+	mgr := h.Configs()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "names": mgr.List(), "default": mgr.GetDefault().ConfigName})
 }
 
-// handleConfigSetDefault 设为默认
 func (s *Server) handleConfigSetDefault(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
 	var req struct {
 		Name string `json:"name"`
 	}
@@ -115,7 +136,7 @@ func (s *Server) handleConfigSetDefault(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少配置名"})
 		return
 	}
-	if err := s.cfg.SetDefault(req.Name); err != nil {
+	if err := h.Configs().SetDefault(req.Name); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

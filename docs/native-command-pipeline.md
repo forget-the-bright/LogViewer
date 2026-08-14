@@ -23,14 +23,10 @@
 
 ### Windows
 
-- 跟踪且有 N：
-  ```powershell
-  [Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8;
-  & { Get-Content -LiteralPath <file> -Encoding UTF8 -Tail N;
-      Get-Content -LiteralPath <file> -Encoding UTF8 -Wait -Tail 0 }
-  ```
-  第一段立即吐末 N 行，第二段从末尾跟随。
-- 跟踪无 N：`Get-Content -Wait`
+- 跟踪且有 N：`Get-Content -LiteralPath <file> -Encoding UTF8 -Wait -Tail N`。
+  `Get-Content -Wait -Tail N` 本身就会先输出末 N 行再持续跟随新增，单条命令即可，
+  不需要分两段。
+- 跟踪无 N：`Get-Content -Wait`（从文件开头读出已有内容后持续跟随）。
 - 静态全量：`[IO.File]::ReadLines(<file>, [Text.Encoding]::UTF8)`（比 `Get-Content` 快）
 - 静态末 N 行：`Get-Content -Tail N`
 
@@ -154,7 +150,7 @@ Unix 大致为：
 ```sh
 tail -F -n 200 '/var/log/app.log' \
   | awk -v s='2026-08-13 00:00:00' -v e='2026-08-13 23:59:59' '<prog>' \
-  | grep -E -i --line-buffered '(?:ERROR|WARN).*timeout' \
+  | grep -E -i --line-buffered '(ERROR|WARN).*timeout' \
   | grep -v -F -i --line-buffered 'health'
 ```
 

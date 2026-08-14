@@ -3,8 +3,6 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 )
 
@@ -12,30 +10,30 @@ import (
 // 拼接顺序：时间范围 -> 日志级别 -> 内容，用 .* 做 AND 连接。
 // 定义了 CustomRegex 时直接使用（优先级最高），忽略其余条件。
 type FilterRule struct {
-	TimeStart     string   `json:"TimeStart"`     // 起，格式 2006-01-02 15:04:05（精确到秒）
-	TimeEnd       string   `json:"TimeEnd"`       // 止
-	TimePrecision string   `json:"TimePrecision"` // 时间粒度: day/hour/minute/second，空=second
-	Levels        []string `json:"Levels"`        // 日志级别，如 ["ERROR","WARN"]，以 | 做 OR
-	Content       string   `json:"Content"`       // 内容关键词（非正则时按字面量转义）
-	Exclude       string   `json:"Exclude"`       // 排除关键词，独立一轮反转过滤
-	CustomRegex   string   `json:"CustomRegex"`   // 自定义正则，优先于拼装
+	TimeStart     string   `json:"TimeStart"`
+	TimeEnd       string   `json:"TimeEnd"`
+	TimePrecision string   `json:"TimePrecision"` // day/hour/minute/second，空=second
+	Levels        []string `json:"Levels"`
+	Content       string   `json:"Content"`
+	Exclude       string   `json:"Exclude"`
+	CustomRegex   string   `json:"CustomRegex"`
 }
 
 // LogConfig 一次日志查看的完整过滤参数。所有字段都映射为系统原生命令参数。
 type LogConfig struct {
 	ConfigName string `json:"ConfigName"`
 	// 读取参数
-	FollowTail     bool   `json:"FollowTail"`     // true=实时跟踪(tail -F / Get-Content -Wait)；false=一次性读取
-	ReadLinesLimit int    `json:"ReadLinesLimit"` // 读取末 N 行，0=全部
-	Encoding       string `json:"Encoding"`       // utf-8 / gbk
-	// 过滤参数（映射 grep/Select-String）
-	CaseSensitive  bool       `json:"CaseSensitive"`  // 大小写敏感
-	InvertMatch    bool       `json:"InvertMatch"`    // 反转匹配（不匹配主模式的行）
-	ContextBefore  int        `json:"ContextBefore"`  // 匹配行前 N 行（grep -B / sls -Context）
-	ContextAfter   int        `json:"ContextAfter"`   // 匹配行后 N 行（grep -A / sls -Context）
-	UseRegex       bool       `json:"UseRegex"`       // 内容/排除是否按正则（时间与级别恒为正则）
-	FilterRule     FilterRule `json:"FilterRule"`     // 过滤规则构建器
-	HighlightRules []string   `json:"HighlightRules"` // 高亮关键词规则
+	FollowTail     bool       `json:"FollowTail"`
+	ReadLinesLimit int        `json:"ReadLinesLimit"`
+	Encoding       string     `json:"Encoding"`
+	// 过滤参数
+	CaseSensitive  bool       `json:"CaseSensitive"`
+	InvertMatch    bool       `json:"InvertMatch"`
+	ContextBefore  int        `json:"ContextBefore"`
+	ContextAfter   int        `json:"ContextAfter"`
+	UseRegex       bool       `json:"UseRegex"`
+	FilterRule     FilterRule `json:"FilterRule"`
+	HighlightRules []string   `json:"HighlightRules"`
 }
 
 // DefaultConfigName 内置默认配置名
@@ -58,62 +56,78 @@ func DefaultConfig() LogConfig {
 	}
 }
 
-// ConfigStore 落在磁盘上的配置仓库
+// ConfigStore 可序列化的配置仓库（落在 logviewer.json 的 hosts.<alias>.configs 下，
+// 历史上也存于独立的 configs.json）。
 type ConfigStore struct {
 	DefaultName string               `json:"default_name"`
 	Configs     map[string]LogConfig `json:"configs"`
 }
 
-// Manager 负责配置的持久化与 CRUD
+// NewConfigStore 返回一个含默认配置的空仓库。
+func NewConfigStore() ConfigStore {
+	return ConfigStore{
+		DefaultName: DefaultConfigName,
+		Configs:     map[string]LogConfig{DefaultConfigName: DefaultConfig()},
+	}
+}
+
+// SaveFunc 由 Manager 在配置变更时回调，把仓库持久化到外部存储
+// （appconfig 写回 logviewer.json）。可为 nil，表示不持久化（纯内存）。
+type SaveFunc func(ConfigStore) error
+
+// Manager 负责配置的 CRUD 与持久化。它本身不关心存储位置，所有落盘动作通过 SaveFunc 完成。
 type Manager struct {
 	mu   sync.Mutex
-	path string
 	data *ConfigStore
+	save SaveFunc
 }
 
-// NewManager 加载或初始化配置仓库。没有配置文件时写入内置默认配置。
-func NewManager(dir string) (*Manager, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+// NewManager 用给定的初始仓库构造 Manager。save 为 nil 时变更只留在内存。
+// 返回的 Manager 会保证 data.Configs 非 nil 且默认配置存在。
+func NewManager(initial ConfigStore, save SaveFunc) *Manager {
+	data := initial
+	if data.Configs == nil {
+		data.Configs = map[string]LogConfig{}
 	}
-	path := filepath.Join(dir, "configs.json")
-	m := &Manager{path: path, data: &ConfigStore{Configs: map[string]LogConfig{}}}
-
-	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
-		if err := json.Unmarshal(b, m.data); err != nil {
-			return nil, fmt.Errorf("解析配置文件失败: %w", err)
-		}
-		if m.data.Configs == nil {
-			m.data.Configs = map[string]LogConfig{}
-		}
-	} else {
-		// 首次运行：写入默认配置
-		def := DefaultConfig()
-		m.data.DefaultName = DefaultConfigName
-		m.data.Configs[DefaultConfigName] = def
-		if err := m.persist(); err != nil {
-			return nil, err
-		}
+	if data.DefaultName == "" {
+		data.DefaultName = DefaultConfigName
 	}
-
-	// 确保默认配置存在
-	if _, ok := m.data.Configs[m.data.DefaultName]; !ok {
-		if m.data.DefaultName == "" {
-			m.data.DefaultName = DefaultConfigName
-		}
-		if _, ok := m.data.Configs[m.data.DefaultName]; !ok {
-			m.data.Configs[m.data.DefaultName] = DefaultConfig()
-		}
+	if _, ok := data.Configs[data.DefaultName]; !ok {
+		data.Configs[data.DefaultName] = DefaultConfig()
 	}
-	return m, nil
+	return &Manager{data: &data, save: save}
 }
 
+// Snapshot 返回当前仓库的深拷贝（供 appconfig 持久化整个 AppConfig 时使用）。
+func (m *Manager) Snapshot() ConfigStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneStore(m.data)
+}
+
+func cloneStore(s *ConfigStore) ConfigStore {
+	out := ConfigStore{
+		DefaultName: s.DefaultName,
+		Configs:     make(map[string]LogConfig, len(s.Configs)),
+	}
+	for k, v := range s.Configs {
+		if v.FilterRule.Levels != nil {
+			v.FilterRule.Levels = append([]string(nil), v.FilterRule.Levels...)
+		}
+		if v.HighlightRules != nil {
+			v.HighlightRules = append([]string(nil), v.HighlightRules...)
+		}
+		out.Configs[k] = v
+	}
+	return out
+}
+
+// persist 在锁内调用 save 钩子。
 func (m *Manager) persist() error {
-	b, err := json.MarshalIndent(m.data, "", "  ")
-	if err != nil {
-		return err
+	if m.save == nil {
+		return nil
 	}
-	return os.WriteFile(m.path, b, 0o644)
+	return m.save(cloneStore(m.data))
 }
 
 // List 返回所有配置名
@@ -148,48 +162,56 @@ func (m *Manager) GetDefault() LogConfig {
 // Save 新增或覆盖保存配置
 func (m *Manager) Save(c LogConfig) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if c.ConfigName == "" {
+		m.mu.Unlock()
 		return fmt.Errorf("配置名不能为空")
 	}
 	m.data.Configs[c.ConfigName] = c
-	return m.persist()
+	err := m.persist()
+	m.mu.Unlock()
+	return err
 }
 
 // Delete 删除配置（默认配置不可删除）
 func (m *Manager) Delete(name string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if name == m.data.DefaultName {
+		m.mu.Unlock()
 		return fmt.Errorf("默认配置不可删除")
 	}
 	if _, ok := m.data.Configs[name]; !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("配置 %q 不存在", name)
 	}
 	delete(m.data.Configs, name)
-	return m.persist()
+	err := m.persist()
+	m.mu.Unlock()
+	return err
 }
 
 // SetDefault 设为默认配置
 func (m *Manager) SetDefault(name string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, ok := m.data.Configs[name]; !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("配置 %q 不存在", name)
 	}
 	m.data.DefaultName = name
-	return m.persist()
+	err := m.persist()
+	m.mu.Unlock()
+	return err
 }
 
 // Rename 重命名配置
 func (m *Manager) Rename(oldName, newName string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	c, ok := m.data.Configs[oldName]
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("配置 %q 不存在", oldName)
 	}
 	if _, exists := m.data.Configs[newName]; exists {
+		m.mu.Unlock()
 		return fmt.Errorf("配置 %q 已存在", newName)
 	}
 	c.ConfigName = newName
@@ -198,5 +220,16 @@ func (m *Manager) Rename(oldName, newName string) error {
 	if m.data.DefaultName == oldName {
 		m.data.DefaultName = newName
 	}
-	return m.persist()
+	err := m.persist()
+	m.mu.Unlock()
+	return err
+}
+
+// MarshalJSON 保证序列化时 Configs 非 nil。
+func (s ConfigStore) MarshalJSON() ([]byte, error) {
+	type alias ConfigStore
+	if s.Configs == nil {
+		s.Configs = map[string]LogConfig{}
+	}
+	return json.Marshal(alias(s))
 }

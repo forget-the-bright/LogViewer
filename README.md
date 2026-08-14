@@ -13,9 +13,15 @@
 
 ## 功能特性
 
-- **目录浏览**：懒加载目录树，根目录可配置，内置路径穿越防护。
+- **目录浏览**：懒加载目录树，根目录可配置，内置路径穿越防护（含符号链接逃逸检测）。
+- **多机器 / SSH 远程**：顶栏切换本机与远程 SSH 机器，自动探测远端平台（Linux/macOS/Windows），
+  远程目录浏览与原始文件下载走 SFTP，远程日志查看/跟踪/过滤/导出走 SSH 原生命令管道，
+  主机密钥 TOFU（首次写入 known_hosts，之后严格校验），断线自动重连、keepalive 保活。
 - **实时跟踪 / 静态查看**：跟踪等价于 `tail -F`（Windows `Get-Content -Wait`），天然兼容
-  logrotate；静态模式一次性读取末 N 行或全文。
+  logrotate；静态模式一次性读取末 N 行或全文。本机与远程共用同一套命令构建与流读取逻辑。
+- **远端能力自适应**：连接时批量探测远端是否具备 `tail/cat/grep/awk/iconv`（最小化容器可能
+  缺 `iconv`/`awk`）；缺失时前端自动禁用 GBK 转码（需 iconv）与时间范围过滤（需 awk），
+  而不是命令静默失败。
 - **过滤规则构建器**：
   - 时间范围（按天/时/分/秒四种粒度，字符串比较，命令长度恒定，不靠正则枚举时刻）
   - 日志级别（OR）
@@ -29,7 +35,12 @@
 - **配置管理**：多套过滤配置保存/另存/重命名/删除/设为默认，持久化到 JSON。
 - **导出**：原始文件下载；按当前表单过滤条件导出（流式，浏览器端带进度条）。
 - **主题**：明 / 暗两套主题，xterm 同步切换。
-- **无残留进程**：停止跟踪或断开 WebSocket 时杀掉整条进程组。
+- **登录认证（可选）**：`auth.enabled=true` 开启会话 Cookie 登录（bcrypt 密码、滑动续期、
+  失败限流、WebSocket 同源校验、登出）；默认关闭，关闭时所有功能直接可用。详见
+  [部署说明](docs/deployment.md)。
+- **可拖拽侧栏**：目录树与内容区之间的分隔条可拖拽改宽（180–600px），宽度记忆到浏览器，
+  长文件名自动省略号并悬停显示全名。
+- **无残留进程**：停止跟踪或断开 WebSocket 时杀掉整条进程组；退出时优雅关闭，先停进程再断 SSH。
 
 ---
 
@@ -46,10 +57,12 @@ go run .
 
 ### 命令行参数
 
-| 参数     | 默认    | 说明                                                         |
-| -------- | ------- | ------------------------------------------------------------ |
-| `-addr`  | `:8080` | HTTP 监听地址                                                |
-| `-dir`   | （空）  | 允许扫描的根工作目录，逗号 / 分号分隔，可多个。为空时默认用进程当前工作目录 |
+| 参数             | 默认    | 说明                                                         |
+| ---------------- | ------- | ------------------------------------------------------------ |
+| `-addr`          | `:8080` | HTTP 监听地址（覆盖 logviewer.json 中的 addr）               |
+| `-dir`           | （空）  | 允许扫描的根工作目录，逗号 / 分号分隔，可多个。会合并到本机 local 主机的 dirs 并去重 |
+| `-config`        | （空）  | 显式指定配置文件路径                                         |
+| `-hash-password` | （空）  | 传入明文密码，生成 bcrypt 哈希后退出（用于配置 auth.password） |
 
 示例：
 
@@ -59,12 +72,21 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
 # Linux/macOS
 ./logviewer -addr :9000 -dir /var/log,/opt/app/logs
+
+# 生成登录密码哈希
+./logviewer -hash-password 'your-password'
 ```
 
 ### 配置文件
 
-首次运行会在可执行文件同目录的 `config/configs.json` 写入内置默认配置。可以直接备份、
-拷贝这个文件迁移配置。
+首次运行会在**可执行文件同目录**生成 `logviewer.json`（查找顺序：`-config` 指定路径
+→ `<exe>/logviewer.json` → `<cwd>/logviewer.json`）。文件支持 `//` 与 `/* */` 注释，
+内含监听地址、登录认证、机器列表、扫描目录、过滤预设等全部配置。
+
+- 旧版 `config/configs.json` 会在首次启动时自动迁移到 `logviewer.json` 的 `hosts.local.configs`，
+  旧文件备份为 `configs.json.bak`。
+- 文件含密码，权限设为 `0600`，请勿提交到代码仓库。
+- 通过界面保存过滤预设时，程序会用标准 JSON 重写该文件，手动添加的注释会丢失。
 
 ---
 
@@ -92,7 +114,7 @@ Windows 下一键全平台打包（6 个目标：windows/linux/darwin × amd64/a
 ## 目录结构
 
 ```
-fsdownload/
+LogViewer/
 ├── main.go                     # 入口：embed 静态资源、装载模块、启动 Gin
 ├── go.mod / go.sum
 ├── build_all_platforms.ps1     # 跨平台打包脚本
@@ -101,9 +123,11 @@ fsdownload/
 │   ├── app.js
 │   ├── style.css
 │   └── vendor/                 # xterm.js / flatpickr 本地 vendor，无需联网
-├── config/                     # 运行时用户配置目录（configs.json）
+├── logviewer.json              # 运行时生成的配置文件（首次启动自动创建）
 ├── internal/
-│   ├── config/                 # 配置结构 + 持久化 CRUD
+│   ├── appconfig/              # logviewer.json 加载(JSONC)/生成/迁移/密码哈希
+│   ├── host/                   # 机器抽象：Host 接口 + LocalHost + SSHHost（SSH/SFTP/远程命令）
+│   ├── config/                 # LogConfig 结构 + 预设 CRUD（内存 + 持久化钩子）
 │   ├── cmdbuild/               # 跨平台命令构建 + 过滤参数拼装
 │   ├── procmgr/                # 子进程管理：启动/读取/节流/杀进程组
 │   └── server/                 # Gin 路由 + 目录浏览 + 配置 API + 导出 + WebSocket
@@ -119,11 +143,17 @@ fsdownload/
 - [开发指南](docs/development.md)
 - [部署说明](docs/deployment.md)
 - [经验总结 / 踩坑记录](docs/lessons.md)
+- [SSH 远程与登录设计](SSH远程与登录设计.md) —— 多机器/SSH 与登录认证均已实现
 
 ---
 
 ## 安全说明
 
-- 仅监听本机回环地址时适合个人本地使用；如需远程访问请自行加认证反代。
-- 所有文件访问都限制在配置的根目录内，后端做了 `filepath.Abs` + `filepath.Rel` 路径穿越校验。
-- 命令构建使用参数化引用（Unix 单引号转义、PowerShell 单引号双写转义），避免 shell 注入。
+- 仅监听本机回环地址且不启用认证时适合个人本地使用；若绑定到非本机地址，程序会在启动时
+  警告"未启用登录认证存在未授权访问风险"，建议把 `auth.enabled` 置为 true（密码用
+  `-hash-password` 生成 bcrypt 哈希），或放在带认证的反向代理之后。
+- 会话 Cookie 为 `HttpOnly; SameSite=Lax`，HTTPS（含反代 `X-Forwarded-Proto: https`）下自动加 `Secure`；
+  启用认证时 WebSocket 做同源校验，防止跨站 WS 劫持。
+- 所有文件访问都限制在配置的根目录内，后端做了 `filepath.Abs` + `filepath.Rel` 路径穿越校验
+  （远程额外做 SFTP `RealPath` 符号链接逃逸检测）。
+- 命令构建使用参数化引用（Unix 单引号转义、PowerShell `-EncodedCommand` UTF-16LE base64），避免 shell 注入。

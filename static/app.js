@@ -8,10 +8,10 @@
     wsIntendedClose: false,
     connected: false,
     running: false,
+    stopping: false,
     paused: false,
     pausedBuffer: [],
     currentFile: "",
-    currentConfigName: "",
     selectedNode: null,
   };
 
@@ -30,18 +30,49 @@
     t._timer = setTimeout(() => (t.className = ""), 3000);
   }
 
+  // 是否启用登录认证（由 /api/auth/status 决定）。未启用时所有 401 逻辑跳过。
+  let authEnabled = false;
+
+  function showLogin() {
+    const mask = $("loginMask");
+    if (mask) mask.classList.add("show");
+    $("loginPass").value = "";
+    setTimeout(() => $("loginUser").focus(), 30);
+    // 断开 WS，避免未登录时的重连风暴
+    state.wsIntendedClose = true;
+    if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
+    state.connected = false;
+    state.running = false;
+    setConnStatus("offline");
+  }
+
+  function hideLogin() {
+    const mask = $("loginMask");
+    if (mask) mask.classList.remove("show");
+    $("loginError").textContent = "";
+  }
+
   async function api(url, opts) {
     const r = await fetch(url, opts);
+    if (r.status === 401 && authEnabled) {
+      showLogin();
+      throw new Error("未登录或会话已过期");
+    }
     const ct = r.headers.get("content-type") || "";
     const data = ct.includes("json") ? await r.json().catch(() => ({})) : {};
     if (!r.ok) throw new Error(data.error || ("请求失败 " + r.status));
     return data;
   }
 
+  // 当前选中的机器别名。阶段一固定 local；阶段二接入顶栏切换器后可变。
+  let currentHost = "local";
+  // 业务 API 都在 /api/h/:host 前缀下（目录/配置/导出）。
+  function hapi(path) { return "/api/h/" + encodeURIComponent(currentHost) + path; }
+
   function setConnStatus(mode) {
     const el = $("connStatus");
     el.className = "status " + mode;
-    const labels = { online: "已连接", offline: "未连接", running: "读取中" };
+    const labels = { online: "已连接", offline: "未连接", running: "读取中", stopping: "停止中" };
     $("connText").textContent = labels[mode] || mode;
   }
 
@@ -280,23 +311,119 @@
       return;
     }
     // 逐行高亮（内容本身不含行号，行号由左侧 gutter 终端显示）
+    // 注意：text 每行都以 '\n' 结尾（Windows 远端可能是 '\r\n'）。
+    // split("\n") 后最后一个元素是空串，因此循环里对每个非末元素输出 "\r\n"
+    // 已经覆盖了所有换行；绝不能再按 endsWith("\n") 额外补一个换行，
+    // 否则追踪模式下每个刷新批次末尾都会多出一个空行。
     const lines = text.split("\n");
     let out = "";
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i];
       const isLast = i === lines.length - 1;
-      if (l !== "") out += colorizeLine(l, highlightRules);
+      // 去掉 CRLF 残留的 '\r'，避免 "\r\r\n" 双回车。
+      const clean = l.endsWith("\r") ? l.slice(0, -1) : l;
+      if (clean !== "") out += colorizeLine(clean, highlightRules);
       if (!isLast) out += "\r\n";
     }
-    if (text.endsWith("\n")) out += "\r\n";
     term.write(out, () => syncGutter());
   }
 
   // ============ 目录树 ============
   const treeEl = $("tree");
 
+  // 机器切换：拉取 /api/hosts 填充顶栏选择器。
+  async function loadHosts() {
+    const data = await api("/api/hosts");
+    const sel = $("hostSelect");
+    sel.innerHTML = "";
+    (data.hosts || []).forEach((h) => {
+      const opt = document.createElement("option");
+      opt.value = h.name;
+      const plat = h.platform || "未知";
+      const status = h.online ? "" : "（离线）";
+      opt.textContent = h.name + " [" + plat + "]" + status;
+      sel.appendChild(opt);
+    });
+    sel.value = currentHost;
+  }
+
+  // 当前机器的命令能力（控制 GBK / 时间过滤是否可用）。
+  let currentCaps = { hasTail: true, hasCat: true, hasGrep: true, hasAwk: true, hasIconv: true };
+
+  async function loadCapabilities() {
+    try {
+      currentCaps = await api(hapi("/capabilities"));
+    } catch (e) {
+      currentCaps = { hasTail: true, hasCat: true, hasGrep: true, hasAwk: true, hasIconv: true };
+    }
+    applyCapabilities();
+  }
+
+  // 根据远端能力禁用/启用 GBK 编码选项和时间过滤控件。
+  function applyCapabilities() {
+    const enc = $("encoding");
+    const gbkOpt = enc.querySelector('option[value="gbk"]');
+    if (gbkOpt) {
+      gbkOpt.disabled = !currentCaps.hasIconv;
+      gbkOpt.textContent = currentCaps.hasIconv ? "GBK" : "GBK（远端缺少 iconv）";
+    }
+    if (!currentCaps.hasIconv && enc.value === "gbk") {
+      enc.value = "utf-8";
+    }
+    const timeDisabled = !currentCaps.hasAwk;
+    ["timeStart", "timeEnd", "timePrecision", "clearTimeBtn"].forEach((id) => {
+      const el = $(id);
+      if (el) el.disabled = timeDisabled;
+    });
+    if (timeDisabled) {
+      if (fpStart) fpStart.clear();
+      if (fpEnd) fpEnd.clear();
+    }
+  }
+
+  // 切换机器：停掉当前 WS、清空目录树与终端、按新 host 重新加载。
+  async function switchHost(name) {
+    if (name === currentHost) return;
+    currentHost = name;
+    // 主动断开旧 WS（wsIntendedClose 阻止自动重连）
+    state.wsIntendedClose = true;
+    if (state.running || state.stopping) wsSend({ action: "stop" });
+    if (state.ws) {
+      try { state.ws.close(); } catch (e) {}
+      state.ws = null;
+    }
+    state.connected = false;
+    state.running = false;
+    state.stopping = false;
+    state.currentFile = "";
+    setConnStatus("offline");
+    treeEl.innerHTML = "";
+    $("filePath").value = "";
+    if (term) term.reset();
+    resetGutter();
+    try {
+      await loadCapabilities();
+      await loadRoots();
+      await loadConfigList();
+      const def = await api(hapi("/config/list"));
+      if (def.default) {
+        const cfg = await api(hapi("/config/get?name=" + encodeURIComponent(def.default)));
+        fillForm(cfg);
+      }
+      // fillForm 可能选中 gbk，需在加载默认配置后再按能力回退禁用
+      applyCapabilities();
+    } catch (e) {
+      const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+      if (!loginShown) toast("切换机器失败: " + e.message, "error");
+    } finally {
+      state.wsIntendedClose = false;
+      connectWS();
+      updateButtons();
+    }
+  }
+
   async function loadRoots() {
-    const data = await api("/api/dir/roots");
+    const data = await api(hapi("/dir/roots"));
     const sel = $("rootSelect");
     sel.innerHTML = "";
     data.roots.forEach((r, i) => {
@@ -313,7 +440,7 @@
 
   async function loadTreeDir(path, container) {
     container.innerHTML = "";
-    const data = await api("/api/dir/list?path=" + encodeURIComponent(path));
+    const data = await api(hapi("/dir/list?path=" + encodeURIComponent(path)));
     renderNodes(data.nodes, container);
   }
 
@@ -336,6 +463,7 @@
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = n.name;
+      name.title = n.name; // 长文件名省略号时 hover 看全名
 
       item.appendChild(arrow);
       item.appendChild(icon);
@@ -378,7 +506,7 @@
     arrow.textContent = "▾";
     if (!childrenEl.dataset.loaded) {
       try {
-        const data = await api("/api/dir/list?path=" + encodeURIComponent(path));
+        const data = await api(hapi("/dir/list?path=" + encodeURIComponent(path)));
         renderNodes(data.nodes, childrenEl);
         childrenEl.dataset.loaded = "1";
       } catch (e) {
@@ -391,14 +519,15 @@
   function selectFile(item, path, name) {
     // 正在读取/跟踪时切换文件：必须先停止当前任务，避免"路径已变、后台仍在追旧文件"的错觉。
     // 点击同一个文件无需提示。
-    if (state.running && path !== $("filePath").value) {
+    if ((state.running || state.stopping) && path !== $("filePath").value) {
       const follow = $("followTail").value === "true";
-      const verb = follow ? "正在实时跟踪" : "正在读取";
+      const verb = state.stopping ? "正在停止" : (follow ? "正在实时跟踪" : "正在读取");
       if (!confirm("当前" + verb + "日志文件，切换前需要先停止。\n是否停止并切换到「" + name + "」？")) {
         return;
       }
       wsSend({ action: "stop" });
       state.running = false;
+      state.stopping = false;
       if (term) term.reset();
       resetGutter();
       setConnStatus("online");
@@ -410,7 +539,6 @@
     state.selectedNode = item;
     state.currentFile = path;
     $("filePath").value = path;
-    state.currentConfigName = name;
     toast("已选择文件: " + name, "success");
   }
 
@@ -594,7 +722,7 @@
     clearTimeout(previewTimer);
     previewTimer = setTimeout(async () => {
       try {
-        const data = await api("/api/config/preview", {
+        const data = await api(hapi("/config/preview"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ FilterRule: readForm().FilterRule, UseRegex: $("useRegex").checked }),
@@ -620,6 +748,15 @@
   function updateButtons() {
     const follow = $("followTail").value === "true";
     const start = $("startBtn"), stop = $("stopBtn");
+    if (state.stopping) {
+      // 停止中：立即给视觉反馈，不阻塞其它操作
+      start.disabled = true;
+      stop.disabled = false;
+      stop.textContent = "停止中...";
+      stop.classList.add("loading");
+      return;
+    }
+    stop.classList.remove("loading");
     if (state.running) {
       start.disabled = true;
       stop.disabled = false;
@@ -632,7 +769,7 @@
   }
 
   async function loadConfigList() {
-    const data = await api("/api/config/list");
+    const data = await api(hapi("/config/list"));
     const sel = $("configSelect");
     sel.innerHTML = "";
     data.names.forEach((n) => {
@@ -648,7 +785,7 @@
   async function loadSelectedConfig() {
     const name = $("configSelect").value;
     if (!name) return;
-    const cfg = await api("/api/config/get?name=" + encodeURIComponent(name));
+    const cfg = await api(hapi("/config/get?name=" + encodeURIComponent(name)));
     fillForm(cfg);
     toast("已加载配置: " + name, "success");
   }
@@ -660,7 +797,7 @@
       if (!propose) return;
       cfg.ConfigName = propose;
     }
-    await api("/api/config/save", {
+    await api(hapi("/config/save"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg),
@@ -673,7 +810,7 @@
   // ============ WebSocket ============
   function connectWS() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(proto + "://" + location.host + "/ws");
+    const ws = new WebSocket(proto + "://" + location.host + "/ws?host=" + encodeURIComponent(currentHost));
     state.ws = ws;
 
     ws.onopen = () => {
@@ -689,8 +826,8 @@
         if (term) term.write("\x1b[91m[错误] " + msg.msg + "\x1b[0m\r\n");
         setConnStatus("online");
       } else if (msg.type === "status") {
-        if (msg.status === "running") { state.running = true; setConnStatus("running"); }
-        else if (msg.status === "stopped") { state.running = false; setConnStatus("online"); }
+        if (msg.status === "running") { state.running = true; state.stopping = false; setConnStatus("running"); }
+        else if (msg.status === "stopped") { state.running = false; state.stopping = false; setConnStatus("online"); }
         else if (msg.status === "waiting") { toast("等待日志文件产生..."); }
         updateButtons();
       }
@@ -698,8 +835,12 @@
     ws.onclose = () => {
       state.connected = false;
       state.running = false;
+      state.stopping = false;
       setConnStatus("offline");
-      if (!state.wsIntendedClose) {
+      updateButtons();
+      // 登录遮罩显示时不自动重连（未授权，避免 2 秒一次的重连风暴）
+      const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+      if (!state.wsIntendedClose && !loginShown) {
         setTimeout(connectWS, 2000);
       }
     };
@@ -716,7 +857,8 @@
     const file = $("filePath").value.trim();
     if (!file) { toast("请先在左侧选择日志文件", "error"); return; }
     // 修改过滤参数后重新开始：先停掉后台旧命令，清空控制台与缓冲，再用新配置启动
-    if (state.running) wsSend({ action: "stop" });
+    if (state.running || state.stopping) wsSend({ action: "stop" });
+    state.stopping = false;
     state.paused = false;
     state.pausedBuffer = [];
     $("pauseBtn").textContent = "暂停";
@@ -726,6 +868,11 @@
   }
 
   function stopView() {
+    // 立即进入"停止中"视觉态（非阻塞），不等服务端 stopped 回执，
+    // 避免远程/本地查杀进程的几百毫秒让用户觉得"点了没反应"。
+    state.stopping = true;
+    setConnStatus("stopping");
+    updateButtons();
     wsSend({ action: "stop" });
   }
 
@@ -776,6 +923,15 @@
     $("exportFilterBtn").disabled = false;
   }
 
+  // 导出类 fetch 不走 api()，这里补 401 处理（会话过期时弹登录）。
+  function authCheck(r) {
+    if (r.status === 401 && authEnabled) {
+      showLogin();
+      throw new Error("未登录或会话已过期");
+    }
+    return r;
+  }
+
   // 流式读取响应体，边下边显示进度（不依赖 Content-Length 也能显示已下载字节）
   async function streamDownload(response) {
     const total = parseInt(response.headers.get("Content-Length") || "0", 10);
@@ -810,7 +966,7 @@
   async function triggerRawDownload(file) {
     showExport("正在导出原始日志...");
     try {
-      const r = await fetch("/api/file/download/origin?path=" + encodeURIComponent(file));
+      const r = authCheck(await fetch(hapi("/file/download/origin?path=" + encodeURIComponent(file))));
       if (!r.ok) {
         let msg = "导出失败 " + r.status;
         try { msg = (await r.json()).error || msg; } catch (e) {}
@@ -832,14 +988,14 @@
     if (exporting) return;
     showExport("正在按过滤条件导出（大文件可能需要一些时间）...");
     try {
-      const r = await fetch(
-        "/api/file/download/filter?path=" + encodeURIComponent(file),
+      const r = authCheck(await fetch(
+        hapi("/file/download/filter?path=" + encodeURIComponent(file)),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(readForm()),
         }
-      );
+      ));
       if (!r.ok) {
         let msg = "导出失败 " + r.status;
         try { msg = (await r.json()).error || msg; } catch (e) {}
@@ -857,6 +1013,9 @@
 
   // ============ 事件绑定 ============
   function bindEvents() {
+    $("hostSelect").addEventListener("change", async (e) => {
+      await switchHost(e.target.value);
+    });
     $("refreshTreeBtn").addEventListener("click", async () => {
       const root = $("rootSelect").value;
       if (root) await loadTreeDir(root, treeEl);
@@ -876,7 +1035,7 @@
       const name = $("configSelect").value;
       if (!name) return;
       if (!confirm("删除配置「" + name + "」？")) return;
-      await api("/api/config/delete", {
+      await api(hapi("/config/delete"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
@@ -886,7 +1045,7 @@
     $("setDefaultCfgBtn").addEventListener("click", async () => {
       const name = $("configSelect").value;
       if (!name) return;
-      await api("/api/config/setdefault", {
+      await api(hapi("/config/setdefault"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
@@ -982,11 +1141,107 @@
       if (!file) { toast("请先选择日志文件", "error"); return; }
       triggerFilteredDownload(file);
     });
+
+    // 登录表单
+    $("loginForm").addEventListener("submit", onLoginSubmit);
+    // 登出
+    $("logoutBtn").addEventListener("click", onLogout);
+
+    initSplitter();
+  }
+
+  // ============ 拖拽侧栏 ============
+  function initSplitter() {
+    const panel = $("treePanel");
+    const splitter = $("splitter");
+    const MIN_W = 180, MAX_W = 600;
+    const KEY = "logviewer-sidebar-width";
+
+    // 恢复记忆宽度
+    try {
+      const saved = parseInt(localStorage.getItem(KEY), 10);
+      if (!isNaN(saved) && saved >= MIN_W && saved <= MAX_W) {
+        panel.style.width = saved + "px";
+      }
+    } catch (e) {}
+
+    let dragging = false;
+    splitter.addEventListener("mousedown", (e) => {
+      if (panel.classList.contains("collapsed")) return;
+      dragging = true;
+      splitter.classList.add("dragging");
+      panel.classList.add("no-transition");
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      // 面板贴左，宽度直接取相对视口左边的距离
+      let w = e.clientX;
+      if (w < MIN_W) w = MIN_W;
+      if (w > MAX_W) w = MAX_W;
+      panel.style.width = w + "px";
+    });
+    const stopDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      splitter.classList.remove("dragging");
+      panel.classList.remove("no-transition");
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      const w = parseInt(panel.style.width, 10);
+      if (!isNaN(w)) {
+        try { localStorage.setItem(KEY, String(w)); } catch (e) {}
+      }
+      fitTerm(); // 宽度变化后让 xterm 重新适配
+    };
+    document.addEventListener("mouseup", stopDrag);
+    document.addEventListener("mouseleave", stopDrag);
+  }
+
+  // ============ 登录 / 登出 ============
+  async function onLoginSubmit(e) {
+    e.preventDefault();
+    const errEl = $("loginError");
+    errEl.textContent = "";
+    const username = $("loginUser").value.trim();
+    const password = $("loginPass").value;
+    if (!username || !password) { errEl.textContent = "请输入用户名和密码"; return; }
+    try {
+      const r = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = r.headers.get("content-type")?.includes("json")
+        ? await r.json().catch(() => ({})) : {};
+      if (!r.ok) {
+        errEl.textContent = data.error || ("登录失败 " + r.status);
+        $("loginPass").value = "";
+        return;
+      }
+      hideLogin();
+      state.wsIntendedClose = false;
+      await init();
+    } catch (err) {
+      errEl.textContent = "网络错误: " + err.message;
+    }
+  }
+
+  async function onLogout() {
+    try { await fetch("/api/logout", { method: "POST" }); } catch (e) {}
+    // 登出后整页重载，回到鉴权判定流程
+    window.location.reload();
   }
 
   // ============ 启动 ============
-  async function init() {
-    // 还原上次主题（默认黑夜）
+  let uiReady = false;
+
+  // 一次性 UI 初始化（主题、flatpickr、事件绑定）。登录后重复 init 不会重复绑定。
+  function setupUI() {
+    if (uiReady) return;
+    uiReady = true;
     let saved = "dark";
     try { saved = localStorage.getItem("logviewer-theme") || "dark"; } catch (e) {}
     applyTheme(saved);
@@ -997,16 +1252,43 @@
     bindEvents();
     syncLimitEnable();
     updateButtons();
+  }
+
+  async function init() {
+    setupUI();
+
+    // 判定是否启用认证 / 当前是否已登录
+    let status = { enabled: false, authed: false };
     try {
+      const r = await fetch("/api/auth/status");
+      if (r.ok) status = await r.json();
+    } catch (e) {}
+    authEnabled = !!status.enabled;
+    const logoutBtn = $("logoutBtn");
+    if (logoutBtn) logoutBtn.style.display = authEnabled ? "" : "none";
+    if (authEnabled && !status.authed) {
+      showLogin();
+      return;
+    }
+    hideLogin();
+    state.wsIntendedClose = false;
+
+    try {
+      await loadHosts();
+      await loadCapabilities();
       await loadRoots();
       await loadConfigList();
-      const def = await api("/api/config/list");
+      const def = await api(hapi("/config/list"));
       if (def.default) {
-        const cfg = await api("/api/config/get?name=" + encodeURIComponent(def.default));
+        const cfg = await api(hapi("/config/get?name=" + encodeURIComponent(def.default)));
         fillForm(cfg);
       }
+      applyCapabilities();
     } catch (e) {
-      toast("初始化失败: " + e.message, "error");
+      // 401 已由 api() 弹出登录遮罩，这里不再重复 toast
+      const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+      if (!loginShown) toast("初始化失败: " + e.message, "error");
+      return;
     }
     updateButtons();
     connectWS();

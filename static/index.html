@@ -11,6 +11,10 @@
 <body>
 <header id="topbar">
   <div class="brand">LogViewer</div>
+  <div class="hosts">
+    <label>机器：</label>
+    <select id="hostSelect" title="选择要查看的机器"></select>
+  </div>
   <div class="roots">
     <label>工作目录：</label>
     <select id="rootSelect" title="选择根工作目录"></select>
@@ -18,6 +22,7 @@
   </div>
   <div class="spacer"></div>
   <button id="themeToggle" title="切换白天/黑夜主题">🌙 黑夜</button>
+  <button id="logoutBtn" class="logout-btn" title="退出登录" style="display:none">退出</button>
   <div id="connStatus" class="status offline"><span class="dot"></span><span id="connText">未连接</span></div>
 </header>
 
@@ -30,6 +35,8 @@
     </div>
     <div id="tree"></div>
   </aside>
+  <!-- 拖拽分隔条：拖动调整左侧目录树宽度 -->
+  <div id="splitter" class="splitter" title="拖动调整宽度"></div>
   <!-- 侧栏收起后的展开条 -->
   <div id="sidebarReopen"><button title="展开侧栏">▶ 日志文件</button></div>
 
@@ -166,6 +173,21 @@
 </div>
 
 <div id="toast"></div>
+
+<!-- 登录遮罩（启用认证且未登录时显示） -->
+<div id="loginMask" class="login-mask">
+  <form id="loginForm" class="login-card">
+    <div class="login-title">LogViewer 登录</div>
+    <label class="login-field">用户名
+      <input id="loginUser" type="text" autocomplete="username" required>
+    </label>
+    <label class="login-field">密码
+      <input id="loginPass" type="password" autocomplete="current-password" required>
+    </label>
+    <div id="loginError" class="login-error"></div>
+    <button type="submit" id="loginBtn" class="btn-primary">登录</button>
+  </form>
+</div>
 
 <!-- 导出进度遮罩 -->
 <div id="exportMask" class="export-mask">

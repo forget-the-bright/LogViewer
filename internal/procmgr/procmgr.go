@@ -16,10 +16,22 @@ const flushInterval = 40 * time.Millisecond
 // 取较大值以减少大文件下的 WebSocket 消息数；实时模式下由定时器保证 40ms 延迟。
 const flushMaxLines = 512
 
-// Proc 封装一个正在运行的日志读取子进程及其输出读取协程
-type Proc struct {
+// Process 抽象一个可被 Manager 管控的进程：既可是本机 *exec.Cmd（localProc），
+// 也可是远程 SSH 会话（sshProc，阶段二实现）。Manager 只依赖这个接口，
+// 不关心进程运行在哪里。
+type Process interface {
+	StdoutPipe() (io.Reader, error)
+	StderrPipe() (io.Reader, error)
+	Start() error
+	// Kill 终止进程及其子进程/进程组（本机杀进程组，远程发信号+关会话）。
+	Kill() error
+	Wait() error
+}
+
+// procRecord 封装一个正在运行的日志读取进程及其输出读取协程
+type procRecord struct {
 	id        uint64
-	cmd       *exec.Cmd
+	proc      Process
 	done      chan struct{} // 进程退出且 stdout/stderr 读取协程全部结束后关闭
 	readersWg sync.WaitGroup
 	once      sync.Once
@@ -30,58 +42,56 @@ type Proc struct {
 // 防止残留 tail / powershell 进程。
 type Manager struct {
 	mu     sync.Mutex
-	procs  map[uint64]*Proc
+	procs  map[uint64]*procRecord
 	nextID uint64
 }
 
 // NewManager 创建进程管理器
 func NewManager() *Manager {
-	return &Manager{procs: make(map[uint64]*Proc)}
+	return &Manager{procs: make(map[uint64]*procRecord)}
 }
 
-// Start 启动子进程并异步读取 stdout/stderr。
+// Start 启动进程并异步读取 stdout/stderr。
 //
 //	outFn: 收到一批 stdout 数据时回调（命令已完成过滤/编码，Go 只转发）
 //	errFn: 收到 stderr 行时回调
 //	doneFn: 进程结束且输出已全部 flush 完毕后回调（无论正常退出或被 kill）
-func (m *Manager) Start(cmd *exec.Cmd, outFn func(string), errFn func(string), doneFn func()) (uint64, error) {
-	stdout, err := cmd.StdoutPipe()
+func (m *Manager) Start(p Process, outFn func(string), errFn func(string), doneFn func()) (uint64, error) {
+	stdout, err := p.StdoutPipe()
 	if err != nil {
 		return 0, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, err := p.StderrPipe()
 	if err != nil {
 		return 0, err
 	}
-	// Unix 下以独立进程组运行，便于 kill 时连同整条管道一并终止
-	applyProcGroup(cmd)
-	if err := cmd.Start(); err != nil {
+	if err := p.Start(); err != nil {
 		return 0, err
 	}
 
 	m.mu.Lock()
 	m.nextID++
 	id := m.nextID
-	p := &Proc{id: id, cmd: cmd, done: make(chan struct{})}
-	m.procs[id] = p
+	rec := &procRecord{id: id, proc: p, done: make(chan struct{})}
+	m.procs[id] = rec
 	m.mu.Unlock()
 
 	// stdout 读取协程：批量 + 独立定时协程 flush，避免 WebSocket 消息风暴
-	p.readersWg.Add(2)
-	go m.readLoop(stdout, outFn, &p.readersWg)
+	rec.readersWg.Add(2)
+	go m.readLoop(stdout, outFn, &rec.readersWg)
 	// stderr 读取协程
-	go m.readLines(stderr, errFn, &p.readersWg)
+	go m.readLines(stderr, errFn, &rec.readersWg)
 
 	// 等待 & 清理协程：
 	// 必须先等 stdout/stderr 读取协程结束（读到 EOF 并完成最后一次 flush），
-	// 再调用 cmd.Wait() —— 这是 os/exec StdoutPipe 的标准用法，也保证 done
+	// 再调用 Wait() —— 这是 os/exec StdoutPipe 的标准用法，也保证 done
 	// 关闭后不会再有 outFn/errFn 回调，杜绝"停止后仍向外写"。
 	go func() {
-		p.readersWg.Wait()
-		_ = cmd.Wait()
-		p.once.Do(func() { close(p.done) })
+		rec.readersWg.Wait()
+		_ = p.Wait()
+		rec.once.Do(func() { close(rec.done) })
 		m.mu.Lock()
-		if m.procs[id] == p {
+		if m.procs[id] == rec {
 			delete(m.procs, id)
 		}
 		m.mu.Unlock()
@@ -90,6 +100,38 @@ func (m *Manager) Start(cmd *exec.Cmd, outFn func(string), errFn func(string), d
 		}
 	}()
 	return id, nil
+}
+
+// LocalProcess 把本机 *exec.Cmd 包装成 Process。
+// Unix 下在 Start 前设置 Setpgid 以便 Kill 时连同整条管道一并终止；
+// Windows 用 taskkill /T 终止进程树。平台差异在 procsys_*.go 中。
+func LocalProcess(cmd *exec.Cmd) Process {
+	return &localProc{cmd: cmd}
+}
+
+type localProc struct {
+	cmd *exec.Cmd
+}
+
+func (l *localProc) StdoutPipe() (io.Reader, error) { return l.cmd.StdoutPipe() }
+func (l *localProc) StderrPipe() (io.Reader, error) { return l.cmd.StderrPipe() }
+
+func (l *localProc) Start() error {
+	// Unix 下以独立进程组运行，便于 kill 时连同整条管道一并终止
+	applyProcGroup(l.cmd)
+	return l.cmd.Start()
+}
+
+func (l *localProc) Wait() error { return l.cmd.Wait() }
+
+func (l *localProc) Kill() error {
+	if l.cmd.Process == nil {
+		return nil
+	}
+	// 先杀整个进程组/进程树（含 sh 的子进程 tail/grep/iconv，
+	// 或 Windows 上 powershell 可能派生的子进程），再兜底 Kill。
+	killGroupByPid(l.cmd.Process.Pid)
+	return l.cmd.Process.Kill()
 }
 
 // readLoop 逐行读取并批量 flush。
@@ -192,16 +234,14 @@ func (m *Manager) Stop(id uint64) {
 	if !ok {
 		return
 	}
-	if p.cmd.Process != nil {
-		// 先杀整个进程组/进程树（含 sh 的子进程 tail/grep/iconv，
-		// 或 Windows 上 powershell 可能派生的子进程），再兜底 Kill。
-		killGroupByPid(p.cmd.Process.Pid)
-		_ = p.cmd.Process.Kill()
-	}
-	// 等待进程退出 + 读取协程把最后一批数据 flush 完，最多等 2 秒。
+	// 杀进程组/进程树（localProc 内部杀 sh 的子进程 tail/grep/iconv，
+	// 或 Windows powershell 可能派生的子进程）。
+	_ = p.proc.Kill()
+	// 等待进程退出 + 读取协程把最后一批数据 flush 完，最多等 1 秒。
+	// Kill 是强杀，管道应很快收到 EOF；1s 足够兜底，避免停止操作长时间卡住前端。
 	select {
 	case <-p.done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Second):
 	}
 }
 
