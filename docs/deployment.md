@@ -58,6 +58,9 @@ logviewer.exe -addr 127.0.0.1:8080 -dir "D:\logs,C:\tomcat\logs"
 | `-dir`             | 允许浏览的根目录，逗号或分号分隔；合并到本机 local 的 dirs 并去重    |
 | `-config`          | 显式指定配置文件路径                                                 |
 | `-hash-password`   | 生成 bcrypt 密码哈希后退出（用于配置 auth.password）                 |
+| `-key`             | 配置密码解密密钥（也可通过 `LOGVIEWER_KEY` 环境变量传入）            |
+| `-encrypt-config`  | 加密配置文件中所有明文密码后退出（需配合 `-key`）                    |
+| `-decrypt-config`  | 解密配置文件中所有加密密码后退出（需配合 `-key`）                    |
 
 ### 运行时生成的文件
 
@@ -148,7 +151,44 @@ sudo systemctl enable --now logviewer
   允许本地 http/ws 混用），防止跨站 WS 劫持。
 - 登出立即失效服务端会话。
 
-## 6. 反向代理与远程访问
+### 密码加密
+
+配置文件中的 SSH 密码和登录密码可用 AES-256-GCM 加密存储，避免明文落盘。
+密钥由用户提供，通过 SHA-256 派生为 32 字节密钥；每次加密使用随机 nonce，
+加密结果以 `enc:v1:` 前缀标识。
+
+```bash
+# 1. 先编辑好 logviewer.json（密码用明文填写），然后加密：
+./logviewer -encrypt-config -key 'your-passphrase'
+
+# 2. 启动时提供密钥（二选一）：
+./logviewer -key 'your-passphrase'
+LOGVIEWER_KEY='your-passphrase' ./logviewer
+
+# 3. 需要改回明文时：
+./logviewer -decrypt-config -key 'your-passphrase'
+```
+
+规则：
+- SSH 密码：明文会被加密；已是 `enc:v1:` 则跳过。
+- 登录密码：明文会被加密；bcrypt 哈希（`$2a$` 等前缀）保持不变。
+- 配置含加密密码但启动时未提供 `-key`/`LOGVIEWER_KEY`，程序会直接报错退出。
+- 解密只在内存中进行，不会写回磁盘；只有显式传 `-encrypt-config`/`-decrypt-config`
+  才修改文件，写回时保持权限 `0600`。
+- 密钥不要落盘、不要写进脚本或 systemd unit；推荐用环境变量或 secrets 管理工具传入。
+
+## 6. 热加载配置
+
+运行时可以不重启重新加载 `logviewer.json`：
+
+- **前端**：顶栏点击"重载配置"按钮（`POST /api/reload`，需登录）。
+- **Unix**：`kill -HUP <pid>` 发送 SIGHUP 信号。
+
+热加载会重新读取配置、重建主机集合：连接参数未变的 SSH 主机会话保留（不中断正在
+跟踪的日志），新增/删除/配置变更的主机自动加入或关闭。认证开关或用户名变化时会
+清空所有现有会话，要求重新登录。Windows 不支持 SIGHUP，只能通过前端按钮触发。
+
+## 7. 反向代理与远程访问
 
 默认建议只监听 `127.0.0.1`。启用上一节的内置登录后可直接绑定到内网地址；
 需要多人访问、TLS 终止或更复杂鉴权时，也可放在反向代理之后。
@@ -166,13 +206,13 @@ location / {
 }
 ```
 
-## 7. 升级
+## 8. 升级
 
 1. 停止旧进程（systemd: `systemctl stop logviewer`）；
 2. 用新二进制覆盖；
 3. 启动。`logviewer.json` 向前兼容，新增字段会在保存时补齐，旧配置不受影响。
 
-## 8. 安全建议
+## 9. 安全建议
 
 - 不要把 `-addr` 直接暴露在公网；启用内置登录或走反向代理并加鉴权。
 - `-dir` 只授予需要查看的日志目录最小权限，不要给整个磁盘根目录。

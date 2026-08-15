@@ -92,6 +92,21 @@ func (h *LocalHost) Dirs() []string {
 	return out
 }
 
+// UpdateDirs 更新本机根目录列表（供热加载使用）。
+// 会重新做 Abs+Clean+去重和符号链接解析。
+func (h *LocalHost) UpdateDirs(dirs []string) {
+	h.roots = nil
+	h.realRoots = nil
+	for _, d := range dirs {
+		h.addRoot(d)
+	}
+	if len(h.roots) == 0 {
+		if cwd, err := os.Getwd(); err == nil {
+			h.addRoot(cwd)
+		}
+	}
+}
+
 // Capabilities 本机假定所有命令可用（Windows 用 PowerShell 原生命令，无需 tail/grep/awk/iconv）。
 func (h *LocalHost) Capabilities() Capabilities {
 	return Capabilities{HasTail: true, HasCat: true, HasGrep: true, HasAwk: true, HasIconv: true}

@@ -38,6 +38,15 @@
 - **登录认证（可选）**：`auth.enabled=true` 开启会话 Cookie 登录（bcrypt 密码、滑动续期、
   失败限流、WebSocket 同源校验、登出）；默认关闭，关闭时所有功能直接可用。详见
   [部署说明](docs/deployment.md)。
+- **密码加密**：AES-256-GCM 加密配置中的 SSH/登录密码（`enc:v1:` 前缀），密钥通过
+  `-key` 或 `LOGVIEWER_KEY` 提供；兼容明文模式，支持 `-encrypt-config` / `-decrypt-config`
+  一次性加解密。
+- **配置热加载**：前端"重载配置"按钮或 Unix `SIGHUP` 信号运行时重新加载配置，未变更的
+  SSH 主机会话保留，正在跟踪的日志不中断。
+- **注释保留**：配置文件支持 JSONC 注释，界面保存过滤预设时通过 hujson AST 局部补丁写回，
+  不破坏其余位置的注释与格式。
+- **断线反馈**：WebSocket 断线显示红色横幅，指数退避重连（1s→30s），"立即重连"按钮可手动触发；
+  机器列表每 10 秒静默刷新在线状态。
 - **可拖拽侧栏**：目录树与内容区之间的分隔条可拖拽改宽（180–600px），宽度记忆到浏览器，
   长文件名自动省略号并悬停显示全名。
 - **无残留进程**：停止跟踪或断开 WebSocket 时杀掉整条进程组；退出时优雅关闭，先停进程再断 SSH。
@@ -57,12 +66,15 @@ go run .
 
 ### 命令行参数
 
-| 参数             | 默认    | 说明                                                         |
-| ---------------- | ------- | ------------------------------------------------------------ |
-| `-addr`          | `:8080` | HTTP 监听地址（覆盖 logviewer.json 中的 addr）               |
-| `-dir`           | （空）  | 允许扫描的根工作目录，逗号 / 分号分隔，可多个。会合并到本机 local 主机的 dirs 并去重 |
-| `-config`        | （空）  | 显式指定配置文件路径                                         |
-| `-hash-password` | （空）  | 传入明文密码，生成 bcrypt 哈希后退出（用于配置 auth.password） |
+| 参数               | 默认    | 说明                                                         |
+| ------------------ | ------- | ------------------------------------------------------------ |
+| `-addr`            | `:8080` | HTTP 监听地址（覆盖 logviewer.json 中的 addr）               |
+| `-dir`             | （空）  | 允许扫描的根工作目录，逗号 / 分号分隔，可多个。会合并到本机 local 主机的 dirs 并去重 |
+| `-config`          | （空）  | 显式指定配置文件路径                                         |
+| `-hash-password`   | （空）  | 传入明文密码，生成 bcrypt 哈希后退出（用于配置 auth.password） |
+| `-key`             | （空）  | 配置密码解密密钥（也可通过 `LOGVIEWER_KEY` 环境变量传入）    |
+| `-encrypt-config`  | `false` | 加密配置文件中所有明文密码后退出（需配合 `-key`）            |
+| `-decrypt-config`  | `false` | 解密配置文件中所有加密密码后退出（需配合 `-key`）            |
 
 示例：
 
@@ -75,6 +87,12 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
 # 生成登录密码哈希
 ./logviewer -hash-password 'your-password'
+
+# 加密配置中的明文密码
+./logviewer -encrypt-config -key 'your-passphrase'
+
+# 用密钥启动（配置中密码已加密）
+./logviewer -key 'your-passphrase'
 ```
 
 ### 配置文件
@@ -86,7 +104,8 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 - 旧版 `config/configs.json` 会在首次启动时自动迁移到 `logviewer.json` 的 `hosts.local.configs`，
   旧文件备份为 `configs.json.bak`。
 - 文件含密码，权限设为 `0600`，请勿提交到代码仓库。
-- 通过界面保存过滤预设时，程序会用标准 JSON 重写该文件，手动添加的注释会丢失。
+- 通过界面保存过滤预设时，程序仅替换对应主机的 `configs` 子树（hujson AST 局部补丁），
+  其余位置的注释与格式保持不变。
 
 ---
 
@@ -125,12 +144,13 @@ LogViewer/
 │   └── vendor/                 # xterm.js / flatpickr 本地 vendor，无需联网
 ├── logviewer.json              # 运行时生成的配置文件（首次启动自动创建）
 ├── internal/
-│   ├── appconfig/              # logviewer.json 加载(JSONC)/生成/迁移/密码哈希
+│   ├── appconfig/              # logviewer.json 加载(JSONC)/生成/迁移/密码哈希/AST 局部补丁
+│   ├── cryptoutil/             # AES-256-GCM 配置密码加解密
 │   ├── host/                   # 机器抽象：Host 接口 + LocalHost + SSHHost（SSH/SFTP/远程命令）
 │   ├── config/                 # LogConfig 结构 + 预设 CRUD（内存 + 持久化钩子）
 │   ├── cmdbuild/               # 跨平台命令构建 + 过滤参数拼装
 │   ├── procmgr/                # 子进程管理：启动/读取/节流/杀进程组
-│   └── server/                 # Gin 路由 + 目录浏览 + 配置 API + 导出 + WebSocket
+│   └── server/                 # Gin 路由 + 目录浏览 + 配置 API + 导出 + WebSocket + 热加载
 └── docs/                       # 设计与经验文档
 ```
 
@@ -143,6 +163,7 @@ LogViewer/
 - [开发指南](docs/development.md)
 - [部署说明](docs/deployment.md)
 - [经验总结 / 踩坑记录](docs/lessons.md)
+- [产品体验建议清单](docs/product-suggestions.md)
 - [SSH 远程与登录设计](SSH远程与登录设计.md) —— 多机器/SSH 与登录认证均已实现
 
 ---

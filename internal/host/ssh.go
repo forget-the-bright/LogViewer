@@ -21,13 +21,12 @@ import (
 	"logviewer/internal/config"
 )
 
-// SSHHost 通过 SSH/SFTP 访问远程机器。
-//
-// 连接是懒建立的：首次 Ls/Stat/Open/ResolvePath 时拨号，失败则下次重试。
-// 后台 keepalive 协程定期发 keepalive@openssh.com，失败则断开，下次操作自动重连。
-// 主机密钥默认 TOFU：首次连接写入 known_hosts_file，之后严格校验；
-// 仅当显式 insecure_skip_host_key=true 才跳过（有日志警告）。
-// Capabilities 描述远端具备哪些命令能力，供前端禁用缺失功能（如最小化容器无 iconv/awk）。
+// knownHostsMu 串行化对 known_hosts 文件的 TOFU 追加写入，
+// 防止多个 SSHHost 首次并发连接时 O_APPEND 写入交错导致文件损坏。
+var knownHostsMu sync.Mutex
+
+// Capabilities 描述远端具备哪些原生命令，供前端禁用缺失功能
+// （如最小化容器无 iconv/awk）。本机恒为全部 true。
 type Capabilities struct {
 	HasTail  bool `json:"hasTail"`
 	HasCat   bool `json:"hasCat"`
@@ -36,6 +35,12 @@ type Capabilities struct {
 	HasIconv bool `json:"hasIconv"`
 }
 
+// SSHHost 通过 SSH/SFTP 访问远程机器。
+//
+// 连接是懒建立的：首次 Ls/Stat/Open/ResolvePath 时拨号，失败则下次重试。
+// 后台 keepalive 协程定期发 keepalive@openssh.com，失败则断开，下次操作自动重连。
+// 主机密钥默认 TOFU：首次连接写入 known_hosts_file，之后严格校验；
+// 仅当显式 insecure_skip_host_key=true 才跳过（有日志警告）。
 type SSHHost struct {
 	name     string
 	sshCfg   appconfig.SSHConfig
@@ -44,6 +49,7 @@ type SSHHost struct {
 	cfgMgr   *config.Manager
 
 	mu            sync.Mutex
+	reconnMu      sync.Mutex // 串行化重连，防止并发失败操作触发多次拨号
 	client        *ssh.Client
 	sftpClient    *sftp.Client
 	realPlatform  string // 探测到的有效平台
@@ -119,35 +125,57 @@ func (h *SSHHost) Platform() string {
 
 func (h *SSHHost) Info() Info {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	p := h.realPlatform
 	if p == "" {
 		p = h.platform
 	}
-	msg := ""
-	if h.client != nil {
+	online := h.client != nil
+	var errMsg string
+	if h.lastErr != nil {
+		errMsg = h.lastErr.Error()
+	}
+	h.mu.Unlock()
+
+	msg := "未连接"
+	if online {
 		msg = "在线"
-	} else {
-		if h.lastErr != nil {
-			msg = h.lastErr.Error()
-		} else {
-			msg = "未连接"
-		}
+	} else if errMsg != "" {
+		msg = errMsg
 	}
 	return Info{
 		Name:      h.name,
 		Platform:  p,
 		Local:     false,
-		Online:    h.client != nil,
-		Available: h.client != nil,
+		Online:    online,
+		Available: online,
 		Message:   msg,
 	}
+}
+
+// Fingerprint 返回主机的连接配置指纹，用于 Rebuild 时判断配置是否变更。
+// 包含名称 + host:port + username + password + key 相关参数。
+func (h *SSHHost) Fingerprint() string {
+	return fmt.Sprintf("%s|%s:%d|%s|%s|%s|%v",
+		h.name, h.sshCfg.Host, h.sshCfg.Port, h.sshCfg.Username,
+		h.sshCfg.Password, h.sshCfg.KnownHostsFile, h.sshCfg.InsecureSkipHostKey)
 }
 
 // ---- 连接管理 ----
 
 // ensureConnected 幂等：已连接直接返回，否则拨号。
+// 使用 reconnMu 串行化重连，防止并发失败操作触发多次拨号。
 func (h *SSHHost) ensureConnected() error {
+	h.mu.Lock()
+	if h.client != nil {
+		h.mu.Unlock()
+		return nil
+	}
+	h.mu.Unlock()
+
+	h.reconnMu.Lock()
+	defer h.reconnMu.Unlock()
+
+	// Double-check：在等锁期间可能已有其他 goroutine 连接成功
 	h.mu.Lock()
 	if h.client != nil {
 		h.mu.Unlock()
@@ -174,38 +202,69 @@ func (h *SSHHost) ensureConnected() error {
 			h.sshCfg.Username, h.sshCfg.Host, h.sshCfg.Port, err))
 	}
 
-	sc, err := sftp.NewClient(client)
-	if err != nil {
-		client.Close()
-		return h.recordErr(fmt.Errorf("SFTP 子系统不可用: %w（请确认远端 sshd_config 启用了 Subsystem sftp）", err))
+	// SSH 握手已由 ssh.Dial 的 Timeout 控制，但 SFTP 子系统协商、平台探测、
+	// 能力探测是握手后的多次往返，异常/慢速服务器可能让它们无限阻塞。
+	// 这里用同一个连接超时把这一整段初始化包起来；超时后关闭 client，
+	// 让仍在阻塞的子请求随连接关闭而返回。
+	type initResult struct {
+		sc        *sftp.Client
+		platform  string
+		realRoots []string
+		caps      Capabilities
+		err       error
 	}
-
-	platform := h.platform
-	if platform == "" {
-		platform, err = detectPlatform(client)
+	initDone := make(chan initResult, 1)
+	go func() {
+		sc, err := sftp.NewClient(client)
 		if err != nil {
-			sc.Close()
-			client.Close()
-			return h.recordErr(fmt.Errorf("平台探测失败: %w", err))
+			initDone <- initResult{err: fmt.Errorf("SFTP 子系统不可用: %w（请确认远端 sshd_config 启用了 Subsystem sftp）", err)}
+			return
 		}
-	}
-
-	// 预解析根目录真实路径（用于符号链接逃逸校验）。
-	realRoots := make([]string, len(h.dirs))
-	sep := remoteSep(platform)
-	for i, d := range h.dirs {
-		cleaned := remoteClean(d, sep)
-		if rp, err := sc.RealPath(cleaned); err == nil {
-			realRoots[i] = remoteClean(rp, sep)
-		} else {
-			// 根目录可能暂不存在（跟踪场景），用词法清洗后的路径兜底。
-			realRoots[i] = cleaned
+		platform := h.platform
+		if platform == "" {
+			platform, err = detectPlatform(client)
+			if err != nil {
+				initDone <- initResult{sc: sc, err: fmt.Errorf("平台探测失败: %w", err)}
+				return
+			}
 		}
-	}
+		// 预解析根目录真实路径（用于符号链接逃逸校验）。
+		realRoots := make([]string, len(h.dirs))
+		sep := remoteSep(platform)
+		for i, d := range h.dirs {
+			cleaned := remoteClean(d, sep)
+			if rp, err := sc.RealPath(cleaned); err == nil {
+				realRoots[i] = remoteClean(rp, sep)
+			} else {
+				// 根目录可能暂不存在（跟踪场景），用词法清洗后的路径兜底。
+				realRoots[i] = cleaned
+			}
+		}
+		caps := detectCapabilities(client, platform)
+		initDone <- initResult{sc: sc, platform: platform, realRoots: realRoots, caps: caps}
+	}()
 
-	// 探测远端命令能力（最小化容器可能缺 iconv/awk）。Windows 远程用 PowerShell，
-	// 不依赖这些 Unix 工具，跳过探测直接标 true。
-	caps := detectCapabilities(client, platform)
+	var res initResult
+	select {
+	case res = <-initDone:
+	case <-time.After(timeout):
+		client.Close()
+		// 等待 goroutine 因连接关闭而返回；最多再等 2s，避免极端情况下永久阻塞。
+		select {
+		case <-initDone:
+		case <-time.After(2 * time.Second):
+			log.Printf("[ssh] %s: 初始化超时后后台清理未在 2s 内返回，放弃等待", h.name)
+		}
+		return h.recordErr(fmt.Errorf("SSH 初始化超时（SFTP/平台/能力探测超过 %s）", timeout))
+	}
+	if res.err != nil {
+		if res.sc != nil {
+			res.sc.Close()
+		}
+		client.Close()
+		return h.recordErr(res.err)
+	}
+	sc, platform, realRoots, caps := res.sc, res.platform, res.realRoots, res.caps
 
 	h.mu.Lock()
 	h.client = client
@@ -453,18 +512,26 @@ func (h *SSHHost) hostKeyCallback() (ssh.HostKeyCallback, error) {
 				return err
 			}
 		}
+		addr := knownhosts.Normalize(net.JoinHostPort(h.sshCfg.Host, strconv.Itoa(h.sshCfg.Port)))
+		line := knownhosts.Line([]string{addr}, key)
+		// 加锁串行化追加写入：不同主机可能共用同一个 known_hosts 文件，
+		// 且同一主机的并发握手也可能同时触发 TOFU。
+		knownHostsMu.Lock()
+		defer knownHostsMu.Unlock()
 		if err := os.MkdirAll(filepath.Dir(khFile), 0o700); err != nil {
 			return fmt.Errorf("创建 .ssh 目录失败: %w", err)
 		}
-		addr := knownhosts.Normalize(net.JoinHostPort(h.sshCfg.Host, strconv.Itoa(h.sshCfg.Port)))
-		line := knownhosts.Line([]string{addr}, key)
 		f, err := os.OpenFile(khFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fmt.Errorf("写入 known_hosts 失败: %w", err)
 		}
-		defer f.Close()
-		if _, err := f.WriteString(line + "\n"); err != nil {
-			return fmt.Errorf("写入 known_hosts 失败: %w", err)
+		_, writeErr := f.WriteString(line + "\n")
+		closeErr := f.Close()
+		if writeErr != nil {
+			return fmt.Errorf("写入 known_hosts 失败: %w", writeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("写入 known_hosts 失败: %w", closeErr)
 		}
 		log.Printf("[ssh] %s: 首次连接，主机密钥已写入 %s", h.name, khFile)
 		return nil

@@ -24,12 +24,13 @@
 
 ```
 internal/
-├── appconfig/  # logviewer.json 加载(JSONC)、默认模板生成、旧配置迁移、密码哈希
+├── appconfig/  # logviewer.json 加载(JSONC)、默认模板生成、旧配置迁移、密码哈希、hujson AST 局部补丁、密码加解密
+├── cryptoutil/ # AES-256-GCM 密码加解密（enc:v1: 前缀格式）
 ├── host/       # 机器抽象：Host 接口 + LocalHost（本机 os/exec）+ SSHHost（SSH/SFTP + 远程命令）
 ├── cmdbuild/   # 把 LogConfig 翻译成各平台的命令脚本（纯字符串构建，无副作用）
 ├── procmgr/    # 子进程的启动、stdout/stderr 读取、节流批量、进程组查杀
 ├── config/     # LogConfig 结构 + 预设 CRUD（内存 + SaveFunc 持久化钩子）
-└── server/     # Gin 路由：机器列表、目录、配置 API、导出、WebSocket
+└── server/     # Gin 路由：机器列表、目录、配置 API、导出、WebSocket、热加载
 ```
 
 ### host —— 机器抽象
@@ -167,6 +168,51 @@ tail/grep 残留。
   会话 token 用 crypto/rand 生成、仅存内存、滑动续期；登录按 IP 限流（60 秒 5 次）。
   默认关闭，关闭时不做任何登录校验。
 - 默认只监听本机地址；绑定非本机地址且未启用认证时，启动会打印安全警告。
+
+## 配置文件与持久化
+
+### JSONC + hujson AST 局部补丁
+
+`logviewer.json` 支持 `//` 和 `/* */` 注释（通过 tailscale/hujson 解析）。唯一的编程式写入场景
+是保存过滤预设（`hosts.<name>.configs`）。为避免整体 `json.Marshal` 重写导致注释全部丢失，
+`PatchHostConfigs` 通过 hujson AST 的 JSON Pointer（`/hosts/<name>/configs`）定位目标值的
+字节区间 `[StartOffset, EndOffset)`，然后做字节拼接替换。其余字段的注释、格式、顺序原封不动。
+
+### 密码加密（AES-256-GCM）
+
+`internal/cryptoutil` 提供对称加密：
+
+- 用户 passphrase 经 SHA-256 派生为 32 字节密钥；
+- 每次加密生成随机 96-bit nonce，AES-256-GCM 加密，输出 `enc:v1:<base64(nonce||ciphertext)>`；
+- 非 `enc:v1:` 前缀的字符串视为明文，原样透传（兼容未加密配置）。
+
+`AppConfig.EncryptPasswords / DecryptPasswords` 对 `auth.password`（bcrypt 哈希跳过）和所有
+`ssh.password` 批量加解密。启动时若检测到加密密码，必须通过 `-key` 或 `LOGVIEWER_KEY` 环境变量
+提供密钥，在内存中解密后运行；`-encrypt-config` / `-decrypt-config` 是写回磁盘的一次性操作。
+
+### 配置热加载
+
+两种手动触发方式：
+
+1. `POST /api/reload`（前端"重载配置"按钮）；
+2. Unix 下发送 `SIGHUP` 信号（Windows 仅 API）。
+
+`reloadCfg` 在锁内重新读取配置文件、解密密码、调用 `host.Manager.Rebuild` 原子替换主机集合。
+`Rebuild` 通过连接指纹（name + host:port + username + password 等关键 SSH 参数）判断主机是否
+变更——指纹相同的实例直接保留，正在跟踪的日志不会中断；新增/删除/配置变更的主机才创建或关闭。
+LocalHost 始终保留（仅通过 `UpdateDirs` 更新根目录）。Reload 后通过 `srv.UpdateAuth` 热更新
+认证配置（开关/用户名变化时清空所有会话）。
+
+不做文件监听自动 reload，避免读到半写入状态。
+
+## 前端交互细节
+
+- 顶栏机器列表每 10 秒静默刷新（`document.hidden` 时跳过），更新在线/离线状态文字；新增/删除
+  的主机动态增删选项，不重建 DOM 避免闪烁。
+- "刷新"按钮同时刷新机器列表和当前目录树。
+- WebSocket 断线时终端顶部显示红色横幅（脉动动画），指数退避重连（1s → 2s → 4s → ... → 最大
+  30s），重连成功后横幅消失；"立即重连"按钮可手动触发。
+- 服务端 WebSocket 有 30s ping / 90s pong 超时保活，防止半开 TCP 连接永久挂起。
 
 ## 优雅关闭
 

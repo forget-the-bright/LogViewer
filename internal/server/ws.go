@@ -31,6 +31,15 @@ type wsMessage struct {
 	Config   config.LogConfig `json:"config"`
 }
 
+const (
+	// wsPingInterval 服务端主动发 ping 的间隔
+	wsPingInterval = 30 * time.Second
+	// wsPongWait 客户端 pong 超时（超过此时长无消息则判定连接已死）
+	wsPongWait = 90 * time.Second
+	// wsWriteWait 写消息的超时
+	wsWriteWait = 10 * time.Second
+)
+
 // handleWS 处理 WebSocket 连接。host 通过 query 参数 ?host= 指定。
 func (s *Server) handleWS(c *gin.Context) {
 	// WebSocket 不能走普通 JSON 中间件，这里在 Upgrade 前显式校验会话 cookie。
@@ -59,13 +68,35 @@ func (s *Server) handleWS(c *gin.Context) {
 	}()
 
 	conn.SetReadLimit(1 << 20)
-	conn.SetReadDeadline(time.Time{})
+	conn.SetReadDeadline(time.Now().Add(wsPongWait))
+
+	// 收到客户端任意消息（含 pong）时续期读超时
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+
+	// 服务端定期发 ping，检测半开连接
+	pingTicker := time.NewTicker(wsPingInterval)
+	defer pingTicker.Stop()
+	go func() {
+		for range pingTicker.C {
+			cl.wmu.Lock()
+			err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait))
+			cl.wmu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
 
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
+		// 收到消息续期读超时
+		conn.SetReadDeadline(time.Now().Add(wsPongWait))
 		var msg wsMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			s.sendError(cl, "消息解析失败: "+err.Error())

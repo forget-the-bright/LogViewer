@@ -17,6 +17,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"logviewer/internal/config"
+	"logviewer/internal/cryptoutil"
 )
 
 // 默认配置文件名。
@@ -43,21 +44,96 @@ func IsBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
 
-// ValidatePassword 用配置里的密码校验明文。哈希走 bcrypt；明文走常量时间比较。
+// ValidatePassword 用配置里的密码校验明文。
+// 密码可能是：bcrypt 哈希、AES 加密后解密的明文、或直接明文。
 func (a AuthConfig) ValidatePassword(plain string) bool {
 	if !a.Enabled || a.Username == "" {
 		return false // 未启用认证
 	}
-	if IsBcryptHash(a.Password) {
-		return bcrypt.CompareHashAndPassword([]byte(a.Password), []byte(plain)) == nil
+	pw := a.Password
+	if cryptoutil.IsEncrypted(pw) {
+		// 加密密码：需要先由 DecryptPasswords 在启动时解密到内存；
+		// 正常流程下不会走到这里（启动时已解密）。防御性处理：拒绝。
+		return false
 	}
-	return subtleEqual(a.Password, plain)
+	if IsBcryptHash(pw) {
+		return bcrypt.CompareHashAndPassword([]byte(pw), []byte(plain)) == nil
+	}
+	return subtleEqual(pw, plain)
 }
 
 // HashPassword 生成 bcrypt 哈希，供 -hash-password 子命令使用。
 func HashPassword(plain string) (string, error) {
 	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
 	return string(b), err
+}
+
+// HasEncryptedPasswords 判断配置中是否存在 enc:v1: 加密的密码字段。
+func (c *AppConfig) HasEncryptedPasswords() bool {
+	if cryptoutil.IsEncrypted(c.Auth.Password) {
+		return true
+	}
+	for _, h := range c.Hosts {
+		if h.SSH != nil && cryptoutil.IsEncrypted(h.SSH.Password) {
+			return true
+		}
+	}
+	return false
+}
+
+// EncryptPasswords 加密所有明文密码字段（原地修改）。
+// bcrypt 哈希（$2a$/$2b$ 开头）保持不变。
+func (c *AppConfig) EncryptPasswords(passphrase string) error {
+	if passphrase == "" {
+		return errors.New("加密密钥不能为空")
+	}
+	// auth.password：明文才加密，bcrypt 哈希跳过
+	if c.Auth.Password != "" && !IsBcryptHash(c.Auth.Password) && !cryptoutil.IsEncrypted(c.Auth.Password) {
+		enc, err := cryptoutil.Encrypt(passphrase, c.Auth.Password)
+		if err != nil {
+			return fmt.Errorf("加密 auth.password 失败: %w", err)
+		}
+		c.Auth.Password = enc
+	}
+	// SSH 密码
+	for name, h := range c.Hosts {
+		if h.SSH == nil || h.SSH.Password == "" || cryptoutil.IsEncrypted(h.SSH.Password) {
+			continue
+		}
+		enc, err := cryptoutil.Encrypt(passphrase, h.SSH.Password)
+		if err != nil {
+			return fmt.Errorf("加密机器 %q 的 ssh.password 失败: %w", name, err)
+		}
+		h.SSH.Password = enc
+		c.Hosts[name] = h
+	}
+	return nil
+}
+
+// DecryptPasswords 解密所有 enc:v1: 密码字段（原地修改，仅内存中）。
+func (c *AppConfig) DecryptPasswords(passphrase string) error {
+	if passphrase == "" {
+		return errors.New("解密密钥不能为空")
+	}
+	if cryptoutil.IsEncrypted(c.Auth.Password) {
+		dec, err := cryptoutil.Decrypt(passphrase, c.Auth.Password)
+		if err != nil {
+			return fmt.Errorf("解密 auth.password 失败: %w", err)
+		}
+		c.Auth.Password = dec
+	}
+	for name, h := range c.Hosts {
+		if h.SSH == nil || !cryptoutil.IsEncrypted(h.SSH.Password) {
+			continue
+		}
+		dec, err := cryptoutil.Decrypt(passphrase, h.SSH.Password)
+		if err != nil {
+			return fmt.Errorf("解密机器 %q 的 ssh.password 失败: %w", name, err)
+		}
+		h.SSH.Password = dec
+		c.Hosts[name] = h
+	}
+	return nil
 }
 
 // SSHConfig 描述一台远程机器的 SSH 连接参数。阶段一仅解析与持久化，不实际连接。
@@ -151,13 +227,15 @@ func Load(path string, extraDirs []string) (*AppConfig, string, error) {
 	return &cfg, abs, nil
 }
 
-// Save 把配置写回磁盘（JSON 缩进）。文件权限 0600（含密码）。
+// Save 把配置写回磁盘（JSON 缩进，原子替换）。文件权限 0600（含密码）。
 func Save(path string, cfg *AppConfig) error {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	return writeFileAtomic(path, b, 0o600)
 }
 
 func (c *AppConfig) applyDefaults() {

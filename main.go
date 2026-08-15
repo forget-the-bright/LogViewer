@@ -19,6 +19,7 @@ import (
 
 	"logviewer/internal/appconfig"
 	"logviewer/internal/config"
+	"logviewer/internal/cryptoutil"
 	"logviewer/internal/host"
 	"logviewer/internal/server"
 )
@@ -31,8 +32,12 @@ func main() {
 	dir := flag.String("dir", "", "允许扫描的根工作目录（逗号/分号分隔，合并到本机 local 主机）")
 	configPath := flag.String("config", "", "配置文件路径（默认 <exe>/logviewer.json，其次 <cwd>/logviewer.json）")
 	hashPw := flag.String("hash-password", "", "生成 bcrypt 密码哈希后退出（用于配置 auth.password）")
+	encryptKey := flag.String("key", "", "配置密码解密密钥（也可通过 LOGVIEWER_KEY 环境变量传入）")
+	encryptCfg := flag.Bool("encrypt-config", false, "加密配置文件中所有明文密码，写回文件后退出（需配合 -key）")
+	decryptCfg := flag.Bool("decrypt-config", false, "解密配置文件中所有加密密码，写回文件后退出（需配合 -key）")
 	flag.Parse()
 
+	// -hash-password：生成 bcrypt 哈希
 	if *hashPw != "" {
 		h, err := appconfig.HashPassword(*hashPw)
 		if err != nil {
@@ -42,13 +47,45 @@ func main() {
 		return
 	}
 
+	// 解析密钥：优先 -key，其次环境变量
+	key := *encryptKey
+	if key == "" {
+		key = os.Getenv("LOGVIEWER_KEY")
+	}
+
+	// -encrypt-config / -decrypt-config：一次性操作
+	if *encryptCfg || *decryptCfg {
+		if key == "" {
+			log.Fatalf("加密/解密操作需要通过 -key 或 LOGVIEWER_KEY 环境变量提供密钥")
+		}
+		cfg, cfgPath, err := appconfig.Load(*configPath, nil)
+		if err != nil {
+			log.Fatalf("加载配置失败: %v", err)
+		}
+		if *encryptCfg {
+			if err := cfg.EncryptPasswords(key); err != nil {
+				log.Fatalf("加密失败: %v", err)
+			}
+			log.Printf("已加密配置文件中的密码: %s", cfgPath)
+		} else {
+			if err := cfg.DecryptPasswords(key); err != nil {
+				log.Fatalf("解密失败: %v", err)
+			}
+			log.Printf("已解密配置文件中的密码: %s", cfgPath)
+		}
+		if err := appconfig.Save(cfgPath, cfg); err != nil {
+			log.Fatalf("写入配置文件失败: %v", err)
+		}
+		return
+	}
+
 	// 静态资源
 	sub, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		log.Fatalf("加载静态资源失败: %v", err)
 	}
 
-	// 加载配置（首次运行会生成带注释模板，并迁移旧 configs.json）
+	// 加载配置
 	var extraDirs []string
 	if *dir != "" {
 		extraDirs = splitList(*dir)
@@ -59,12 +96,23 @@ func main() {
 	}
 	log.Printf("配置文件: %s", cfgPath)
 
+	// 如果配置中有加密密码，必须提供密钥并在内存中解密
+	if appCfg.HasEncryptedPasswords() {
+		if key == "" {
+			log.Fatalf("配置中包含加密密码，必须通过 -key 或 LOGVIEWER_KEY 环境变量提供解密密钥")
+		}
+		if err := appCfg.DecryptPasswords(key); err != nil {
+			log.Fatalf("解密配置密码失败: %v", err)
+		}
+		log.Printf("已使用密钥在内存中解密配置密码")
+	}
+
 	listenAddr := *addr
 	if listenAddr == "" {
 		listenAddr = appCfg.Addr
 	}
 
-	// 构造 host.Manager。阶段一只有 local 实际可用；配置中的 SSH 主机暂不连接。
+	// 构造 host.Manager
 	hm, err := buildHostManager(appCfg, cfgPath)
 	if err != nil {
 		log.Fatalf("初始化机器失败: %v", err)
@@ -81,7 +129,44 @@ func main() {
 		log.Printf("机器: [%s] %s (%s) dirs=%v", kind, info.Name, platform, dirsOf(hm, info.Name))
 	}
 
-	srv := server.New(hm, sub, appCfg.Auth)
+	// 配置变更时的持久化闭包（保留 appCfg 引用供 reload 使用）
+	var cfgMu sync.Mutex
+
+	// 重建 host.Manager 的闭包，供 reload 调用
+	rebuildHosts := func(newCfg *appconfig.AppConfig) error {
+		return rebuildHostManager(hm, newCfg, cfgPath)
+	}
+
+	// reload 在锁内更新 appCfg 并重建 host manager
+	reloadCfg := func() (*appconfig.AppConfig, error) {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		newCfg, _, err := appconfig.Load(cfgPath, extraDirs)
+		if err != nil {
+			return nil, err
+		}
+		if newCfg.HasEncryptedPasswords() {
+			if key == "" {
+				return nil, errors.New("配置中包含加密密码，但未提供解密密钥")
+			}
+			if err := newCfg.DecryptPasswords(key); err != nil {
+				return nil, err
+			}
+		}
+		if err := rebuildHosts(newCfg); err != nil {
+			return nil, err
+		}
+		appCfg = newCfg
+		return newCfg, nil
+	}
+
+	srv := server.New(server.Options{
+		Hosts:      hm,
+		Static:     sub,
+		Auth:       appCfg.Auth,
+		ConfigPath: cfgPath,
+		ReloadFunc: reloadCfg,
+	})
 	displayAddr := listenAddr
 	if strings.HasPrefix(displayAddr, ":") {
 		displayAddr = "127.0.0.1" + displayAddr
@@ -91,6 +176,26 @@ func main() {
 	httpSrv := &http.Server{Addr: listenAddr, Handler: srv.Router()}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// SIGHUP 热加载（Unix only，Windows 下该信号不存在但不影响编译）
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGHUP)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				log.Printf("收到 SIGHUP，正在重新加载配置...")
+				if newCfg, err := reloadCfg(); err != nil {
+					log.Printf("配置重载失败: %v", err)
+				} else {
+					srv.UpdateAuth(newCfg.Auth)
+					log.Printf("配置重载成功，共 %d 台机器", len(newCfg.Hosts))
+				}
+			}
+		}
+	}()
 
 	go func() {
 		log.Printf("LogViewer 启动，访问 http://%s", displayAddr)
@@ -110,8 +215,6 @@ func main() {
 	log.Printf("已退出")
 }
 
-// logStartupWarnings 打印安全相关的启动告警：明文登录密码、非 loopback 无认证。
-// authEnabled 是配置层面“认证是否生效”的统一判定：enabled=true 且用户名非空。
 func authEnabled(cfg *appconfig.AppConfig) bool {
 	return cfg.Auth.Enabled && cfg.Auth.Username != ""
 }
@@ -120,7 +223,8 @@ func logStartupWarnings(cfg *appconfig.AppConfig, addr string) {
 	if authEnabled(cfg) {
 		ttl := time.Duration(cfg.Auth.SessionTTLMinutes) * time.Minute
 		log.Printf("登录认证已启用（用户: %s，会话有效期: %s）", cfg.Auth.Username, ttl)
-		if !appconfig.IsBcryptHash(cfg.Auth.Password) {
+		pw := cfg.Auth.Password
+		if !appconfig.IsBcryptHash(pw) && !cryptoutil.IsEncrypted(pw) {
 			log.Printf("警告: auth.password 为明文，建议用 `logviewer -hash-password <明文>` 生成 bcrypt 哈希后填写")
 		}
 	} else {
@@ -138,16 +242,16 @@ func logStartupWarnings(cfg *appconfig.AppConfig, addr string) {
 	}
 }
 
-// buildHostManager 从 AppConfig 构造所有 Host。
-// 每台机器的过滤预设变更时，通过闭包回写到 AppConfig 并持久化到 logviewer.json。
-func buildHostManager(appCfg *appconfig.AppConfig, cfgPath string) (*host.Manager, error) {
+// buildHosts 从 AppConfig 构造所有 Host 实例（本机 + SSH 远程）。
+// 持久化闭包只负责把配置 AST 补丁写回磁盘；config.Manager 自己持有内存中的最新 store，
+// 因此不需要回写到某个 AppConfig 快照（避免 reload 后旧闭包让 appCfg 镜像过期）。
+func buildHosts(appCfg *appconfig.AppConfig, cfgPath string) ([]host.Host, error) {
 	var mu sync.Mutex
 	saveCfgFor := func(name string) config.SaveFunc {
 		return func(store config.ConfigStore) error {
 			mu.Lock()
 			defer mu.Unlock()
-			appCfg.UpdateHostConfigs(name, store)
-			return appconfig.Save(cfgPath, appCfg)
+			return appconfig.PatchHostConfigs(cfgPath, name, store)
 		}
 	}
 
@@ -158,7 +262,6 @@ func buildHostManager(appCfg *appconfig.AppConfig, cfgPath string) (*host.Manage
 	}
 	hosts := []host.Host{local}
 
-	// 远程主机（保持配置里的顺序，local 之后）。
 	for name, hc := range appCfg.Hosts {
 		if name == "local" || hc.SSH == nil {
 			continue
@@ -169,7 +272,26 @@ func buildHostManager(appCfg *appconfig.AppConfig, cfgPath string) (*host.Manage
 		}
 		hosts = append(hosts, sh)
 	}
+	return hosts, nil
+}
+
+// buildHostManager 从 AppConfig 构造一个新的 host.Manager。
+func buildHostManager(appCfg *appconfig.AppConfig, cfgPath string) (*host.Manager, error) {
+	hosts, err := buildHosts(appCfg, cfgPath)
+	if err != nil {
+		return nil, err
+	}
 	return host.NewManager(hosts...)
+}
+
+// rebuildHostManager 根据新配置重建 Manager 中的主机集合，保留未变更的主机。
+func rebuildHostManager(hm *host.Manager, newCfg *appconfig.AppConfig, cfgPath string) error {
+	hosts, err := buildHosts(newCfg, cfgPath)
+	if err != nil {
+		return err
+	}
+	hm.Rebuild(hosts)
+	return nil
 }
 
 func dirsOf(hm *host.Manager, name string) []string {

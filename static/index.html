@@ -18,7 +18,8 @@
   <div class="roots">
     <label>工作目录：</label>
     <select id="rootSelect" title="选择根工作目录"></select>
-    <button id="refreshTreeBtn" title="刷新目录树">刷新</button>
+    <button id="refreshTreeBtn" title="刷新机器状态与目录树">刷新</button>
+    <button id="reloadCfgBtn" title="重新加载配置文件（热加载）">重载配置</button>
   </div>
   <div class="spacer"></div>
   <button id="themeToggle" title="切换白天/黑夜主题">🌙 黑夜</button>
@@ -167,6 +168,10 @@
       <div class="term-wrap">
         <div id="gutter"></div>
         <div id="terminal"></div>
+        <div id="disconnectBanner" class="disconnect-banner">
+          <span class="banner-text">连接已断开，正在尝试重连...</span>
+          <button id="reconnectBtn" class="banner-btn">立即重连</button>
+        </div>
       </div>
     </section>
   </main>

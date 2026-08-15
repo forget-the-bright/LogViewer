@@ -246,14 +246,39 @@ func (h *SSHHost) runOneShot(cmdline string) error {
 }
 
 // newSession 从当前 client 创建一个新 session（供 StdoutPipe 使用）。
+// 如果连接已断开，尝试重连后再创建。
 func (h *SSHHost) newSession() (*ssh.Session, error) {
 	h.mu.Lock()
 	client := h.client
 	h.mu.Unlock()
 	if client == nil {
-		return nil, errors.New("SSH 未连接")
+		// 连接已断开，触发重连
+		if err := h.ensureConnected(); err != nil {
+			return nil, err
+		}
+		h.mu.Lock()
+		client = h.client
+		h.mu.Unlock()
+		if client == nil {
+			return nil, errors.New("SSH 未连接")
+		}
 	}
-	return client.NewSession()
+	sess, err := client.NewSession()
+	if err != nil && isConnErr(err) {
+		// 会话创建失败且为连接错误，断开重连后重试一次
+		h.closeConn()
+		if err2 := h.ensureConnected(); err2 != nil {
+			return nil, err2
+		}
+		h.mu.Lock()
+		client = h.client
+		h.mu.Unlock()
+		if client == nil {
+			return nil, errors.New("SSH 未连接")
+		}
+		return client.NewSession()
+	}
+	return sess, err
 }
 
 // setPid 由 pidFilterReader 在解析到 PID 时调用。

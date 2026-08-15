@@ -15,6 +15,12 @@
     selectedNode: null,
   };
 
+  // WebSocket 指数退避重连
+  const RECONNECT_BASE = 1000;
+  const RECONNECT_MAX = 30000;
+  let reconnectDelay = RECONNECT_BASE;
+  let reconnectTimer = null;
+
   const MAX_PAUSED_BUFFER = 5000; // 暂停期间最多缓冲行数
   const HIGHLIGHT_ANSI = "\x1b[97;48;5;160m"; // 白字红底
   const RESET_ANSI = "\x1b[0m";
@@ -30,6 +36,23 @@
     t._timer = setTimeout(() => (t.className = ""), 3000);
   }
 
+  // 包裹事件处理器中的 async 函数，捕获异常并 toast，避免 unhandled rejection。
+  function safeRun(fn) {
+    return function (...args) {
+      try {
+        const r = fn.apply(this, args);
+        if (r && typeof r.then === "function") {
+          r.catch((e) => {
+            const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+            if (!loginShown) toast((e && e.message) || String(e), "error");
+          });
+        }
+      } catch (e) {
+        toast((e && e.message) || String(e), "error");
+      }
+    };
+  }
+
   // 是否启用登录认证（由 /api/auth/status 决定）。未启用时所有 401 逻辑跳过。
   let authEnabled = false;
 
@@ -40,6 +63,8 @@
     setTimeout(() => $("loginUser").focus(), 30);
     // 断开 WS，避免未登录时的重连风暴
     state.wsIntendedClose = true;
+    cancelReconnect();
+    hideDisconnectBanner();
     if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
     state.connected = false;
     state.running = false;
@@ -255,7 +280,6 @@
     ro.observe($("termPanel"));
   }
   window.addEventListener("resize", fitTerm);
-  window.__fitTerm = fitTerm;
 
   // 高亮：把一行内命中关键词的片段用 ANSI 包裹
   function colorizeLine(line, rules) {
@@ -335,6 +359,7 @@
   async function loadHosts() {
     const data = await api("/api/hosts");
     const sel = $("hostSelect");
+    const prevHost = currentHost;
     sel.innerHTML = "";
     (data.hosts || []).forEach((h) => {
       const opt = document.createElement("option");
@@ -344,7 +369,74 @@
       opt.textContent = h.name + " [" + plat + "]" + status;
       sel.appendChild(opt);
     });
-    sel.value = currentHost;
+    // 如果之前选中的主机已不存在，切回 local
+    if (sel.querySelector('option[value="' + prevHost + '"]')) {
+      sel.value = prevHost;
+    } else {
+      sel.value = "local";
+      if (prevHost !== "local") {
+        await switchHost("local");
+      }
+    }
+  }
+
+  // 自动刷新机器列表（不打断当前操作，仅静默更新下拉框状态文字）
+  let hostsTimer = null;
+  async function refreshHosts() {
+    if (document.hidden) return;
+    try {
+      const data = await api("/api/hosts");
+      const sel = $("hostSelect");
+      const prevValue = sel.value;
+      // 静默更新选项文本（在线/离线状态），不重建 DOM 以避免闪烁
+      const hosts = data.hosts || [];
+      const existing = {};
+      Array.from(sel.options).forEach((o) => { existing[o.value] = o; });
+      hosts.forEach((h) => {
+        const plat = h.platform || "未知";
+        const status = h.online ? "" : "（离线）";
+        const text = h.name + " [" + plat + "]" + status;
+        if (existing[h.name]) {
+          existing[h.name].textContent = text;
+          delete existing[h.name];
+        } else {
+          const opt = document.createElement("option");
+          opt.value = h.name;
+          opt.textContent = text;
+          sel.appendChild(opt);
+        }
+      });
+      // 删除已不存在的主机选项
+      Object.values(existing).forEach((o) => o.remove());
+      if (sel.querySelector('option[value="' + prevValue + '"]')) {
+        sel.value = prevValue;
+      } else {
+        sel.value = "local";
+        if (prevValue !== "local") await switchHost("local");
+      }
+    } catch (e) {
+      // 静默失败：自动刷新不应打扰用户
+    }
+  }
+
+  // 热加载配置文件
+  async function reloadConfig() {
+    try {
+      const data = await api("/api/reload", { method: "POST" });
+      await loadHosts();
+      // 如果当前主机仍存在，刷新其根目录和配置
+      const sel = $("hostSelect");
+      if (sel.querySelector('option[value="' + currentHost + '"]')) {
+        await loadCapabilities();
+        await loadRoots();
+        await loadConfigList();
+      } else {
+        await switchHost("local");
+      }
+      toast("配置已重载（共 " + ((data.hosts || []).length) + " 台机器）", "success");
+    } catch (e) {
+      toast("重载失败: " + e.message, "error");
+    }
   }
 
   // 当前机器的命令能力（控制 GBK / 时间过滤是否可用）。
@@ -385,8 +477,10 @@
   async function switchHost(name) {
     if (name === currentHost) return;
     currentHost = name;
-    // 主动断开旧 WS（wsIntendedClose 阻止自动重连）
+    // 主动断开旧 WS（wsIntendedClose 阻止自动重连），并取消任何挂起的重连定时器
     state.wsIntendedClose = true;
+    cancelReconnect();
+    hideDisconnectBanner();
     if (state.running || state.stopping) wsSend({ action: "stop" });
     if (state.ws) {
       try { state.ws.close(); } catch (e) {}
@@ -808,6 +902,30 @@
   }
 
   // ============ WebSocket ============
+  function showDisconnectBanner() {
+    const b = $("disconnectBanner");
+    if (b) b.classList.add("show");
+  }
+  function hideDisconnectBanner() {
+    const b = $("disconnectBanner");
+    if (b) b.classList.remove("show");
+  }
+
+  function cancelReconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+    if (state.wsIntendedClose || loginShown) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectWS();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  }
+
   function connectWS() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(proto + "://" + location.host + "/ws?host=" + encodeURIComponent(currentHost));
@@ -815,6 +933,8 @@
 
     ws.onopen = () => {
       state.connected = true;
+      reconnectDelay = RECONNECT_BASE;
+      hideDisconnectBanner();
       setConnStatus(state.running ? "running" : "online");
     };
     ws.onmessage = (ev) => {
@@ -838,13 +958,17 @@
       state.stopping = false;
       setConnStatus("offline");
       updateButtons();
-      // 登录遮罩显示时不自动重连（未授权，避免 2 秒一次的重连风暴）
-      const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
-      if (!state.wsIntendedClose && !loginShown) {
-        setTimeout(connectWS, 2000);
+      // 若之前是连接状态，显示断线横幅（首次加载未连上时不显示）
+      if (!state.wsIntendedClose) {
+        const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+        if (!loginShown) showDisconnectBanner();
       }
+      scheduleReconnect();
     };
-    ws.onerror = () => { ws.close(); };
+    ws.onerror = () => {
+      if (term) term.write("\x1b[91m[连接错误] WebSocket 连接异常，正在尝试重连...\x1b[0m\r\n");
+      ws.close();
+    };
   }
 
   function wsSend(obj) {
@@ -1013,17 +1137,25 @@
 
   // ============ 事件绑定 ============
   function bindEvents() {
-    $("hostSelect").addEventListener("change", async (e) => {
+    $("hostSelect").addEventListener("change", safeRun(async (e) => {
       await switchHost(e.target.value);
-    });
-    $("refreshTreeBtn").addEventListener("click", async () => {
+    }));
+    $("refreshTreeBtn").addEventListener("click", safeRun(async () => {
+      await refreshHosts();
       const root = $("rootSelect").value;
       if (root) await loadTreeDir(root, treeEl);
+      toast("已刷新", "success");
+    }));
+    $("reloadCfgBtn").addEventListener("click", safeRun(reloadConfig));
+    $("reconnectBtn").addEventListener("click", () => {
+      cancelReconnect();
+      reconnectDelay = RECONNECT_BASE;
+      connectWS();
     });
-    $("rootSelect").addEventListener("change", async () => {
+    $("rootSelect").addEventListener("change", safeRun(async () => {
       const root = $("rootSelect").value;
       if (root) await loadTreeDir(root, treeEl);
-    });
+    }));
 
     $("loadCfgBtn").addEventListener("click", loadSelectedConfig);
     $("saveCfgBtn").addEventListener("click", () => saveConfig($("cfgName").value));
@@ -1292,6 +1424,14 @@
     }
     updateButtons();
     connectWS();
+
+    // 启动机器列表自动刷新（10 秒一次，标签页隐藏时跳过）
+    if (!hostsTimer) {
+      hostsTimer = setInterval(refreshHosts, 10000);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) refreshHosts();
+      });
+    }
   }
 
   init();

@@ -35,7 +35,7 @@ func baseName(p string) string {
 
 // streamProcessToResponse 启动进程并把 stdout 流式写到 HTTP 响应。
 // 整个读取/过滤都由原生命令完成，Go 只做字节转发（纯外壳）。
-// 用大块 io.Copy 转发，避免高频 flush 拖慢大文件导出。
+// 客户端断开时通过 context 取消终止命令进程，避免孤儿进程。
 func streamProcessToResponse(c *gin.Context, p procmgr.Process) {
 	stdout, err := p.StdoutPipe()
 	if err != nil {
@@ -46,15 +46,29 @@ func streamProcessToResponse(c *gin.Context, p procmgr.Process) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "命令启动失败: " + err.Error()})
 		return
 	}
+
+	ctx := c.Request.Context()
+	done := make(chan struct{})
 	defer func() {
 		_ = p.Kill()
 		_ = p.Wait()
 	}()
 
+	// 监听客户端断开，终止命令进程
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = p.Kill()
+		case <-done:
+		}
+	}()
+
 	if _, err := io.Copy(c.Writer, stdout); err != nil {
 		// 客户端中断等：不写 JSON（头可能已发），直接返回
+		close(done)
 		return
 	}
+	close(done)
 }
 
 // handleDownloadOrigin 下载原始日志文件（字节级原样输出）。

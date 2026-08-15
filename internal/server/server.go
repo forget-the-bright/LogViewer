@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -14,27 +15,54 @@ import (
 	"logviewer/internal/procmgr"
 )
 
+// Options 是构造 Server 的参数集合。
+type Options struct {
+	Hosts      *host.Manager
+	Static     fs.FS
+	Auth       appconfig.AuthConfig
+	ConfigPath string
+	ReloadFunc func() (*appconfig.AppConfig, error)
+}
+
 // Server 聚合后端各模块。文件/命令操作全部通过 Host 抽象完成，
 // 本机与远程机器共用同一套 HTTP/WS 逻辑。
 type Server struct {
-	hosts  *host.Manager
-	procs  *procmgr.Manager
-	static fs.FS
-	auth   *authService
+	hosts      *host.Manager
+	procs      *procmgr.Manager
+	static     fs.FS
+	auth       *authService
+	configPath string
+	reloadFn   func() (*appconfig.AppConfig, error)
 }
 
-// New 创建 Server。static 为嵌入式前端资源（可为 nil），authCfg 控制登录认证。
-func New(hosts *host.Manager, static fs.FS, authCfg appconfig.AuthConfig) *Server {
+// New 创建 Server。
+func New(opts Options) *Server {
 	return &Server{
-		hosts:  hosts,
-		procs:  procmgr.NewManager(),
-		static: static,
-		auth:   newAuthService(authCfg),
+		hosts:      opts.Hosts,
+		procs:      procmgr.NewManager(),
+		static:     opts.Static,
+		auth:       newAuthService(opts.Auth),
+		configPath: opts.ConfigPath,
+		reloadFn:   opts.ReloadFunc,
 	}
 }
 
 // Auth 暴露认证服务（供 main 打印启用状态）。
 func (s *Server) Auth() *authService { return s.auth }
+
+// UpdateAuth 热更新认证配置（reload 后调用）。若认证开关状态或用户名变化，清空所有现有会话。
+func (s *Server) UpdateAuth(cfg appconfig.AuthConfig) {
+	s.auth.mu.Lock()
+	authChanged := s.auth.enabled != (cfg.Enabled && cfg.Username != "") || s.auth.username != cfg.Username
+	s.auth.enabled = cfg.Enabled && cfg.Username != ""
+	s.auth.username = cfg.Username
+	s.auth.ttl = time.Duration(cfg.SessionTTLMinutes) * time.Minute
+	s.auth.check = cfg.ValidatePassword
+	if authChanged {
+		s.auth.sessions = map[string]time.Time{}
+	}
+	s.auth.mu.Unlock()
+}
 
 // Close 释放后端资源：先停掉所有正在运行的日志进程（含远程进程组查杀），
 // 再关闭所有机器连接（SSH keepalive/客户端）。供优雅关闭时调用。
@@ -115,6 +143,7 @@ func (s *Server) Router() *gin.Engine {
 	authApi.Use(s.authRequired())
 	{
 		authApi.POST("/logout", s.handleLogout)
+		authApi.POST("/reload", s.handleReload)
 		authApi.GET("/hosts", s.handleHosts)
 
 		h := authApi.Group("/h/:host")
@@ -157,6 +186,24 @@ func (s *Server) Router() *gin.Engine {
 // handleHosts 返回所有机器概要，供顶栏切换器使用。
 func (s *Server) handleHosts(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"hosts": s.hosts.List()})
+}
+
+// handleReload 触发配置热加载（重新读取配置文件、重建主机集合）。
+func (s *Server) handleReload(c *gin.Context) {
+	if s.reloadFn == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "服务器未配置热加载功能"})
+		return
+	}
+	newCfg, err := s.reloadFn()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "配置重载失败: " + err.Error()})
+		return
+	}
+	s.UpdateAuth(newCfg.Auth)
+	c.JSON(http.StatusOK, gin.H{
+		"ok":    true,
+		"hosts": s.hosts.List(),
+	})
 }
 
 // handleCapabilities 返回目标机器的原生命令能力（前端据此禁用 GBK/时间过滤等）。

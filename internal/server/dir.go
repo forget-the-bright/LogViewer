@@ -23,16 +23,12 @@ func (s *Server) handleListDir(c *gin.Context) {
 		return
 	}
 	raw := c.Query("path")
+	// Ls 内部已调用 ResolvePath 完成路径校验与规范化，无需重复调用
+	// （SSH 下重复调用会产生额外的 SFTP 往返）。
 	nodes, err := h.Ls(raw)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	// ResolvePath 已在 Ls 内部完成，这里回显规范化后的路径
-	abs, err := h.ResolvePath(raw)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"path": abs, "nodes": nodes})
+	c.JSON(http.StatusOK, gin.H{"path": raw, "nodes": nodes})
 }
