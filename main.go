@@ -27,6 +27,10 @@ import (
 //go:embed all:static
 var staticFS embed.FS
 
+// version 由构建时通过 -ldflags "-X main.version=..." 注入，值来自根目录 VERSION
+// 文件。未注入时（如 go run）显示 "dev"。版本号只能由开发者手动修改 VERSION。
+var version = "dev"
+
 func main() {
 	addr := flag.String("addr", "", "HTTP 监听地址（覆盖 logviewer.json 中的 addr）")
 	dir := flag.String("dir", "", "允许扫描的根工作目录（逗号/分号分隔，合并到本机 local 主机）")
@@ -73,7 +77,9 @@ func main() {
 			}
 			log.Printf("已解密配置文件中的密码: %s", cfgPath)
 		}
-		if err := appconfig.Save(cfgPath, cfg); err != nil {
+		// 只原位替换发生变化的密码标量，保留文件其余注释、格式以及
+		// 注释掉的远程主机示例。绝不用全量 Marshal 重写整个文件。
+		if err := appconfig.SpliceConfigValues(cfgPath, cfg.PasswordFieldPointers()); err != nil {
 			log.Fatalf("写入配置文件失败: %v", err)
 		}
 		return
@@ -132,32 +138,33 @@ func main() {
 	// 配置变更时的持久化闭包（保留 appCfg 引用供 reload 使用）
 	var cfgMu sync.Mutex
 
-	// 重建 host.Manager 的闭包，供 reload 调用
-	rebuildHosts := func(newCfg *appconfig.AppConfig) error {
+	// 重建 host.Manager 的闭包，供 reload 调用。返回被替换/移除的主机别名。
+	rebuildHosts := func(newCfg *appconfig.AppConfig) ([]string, error) {
 		return rebuildHostManager(hm, newCfg, cfgPath)
 	}
 
 	// reload 在锁内更新 appCfg 并重建 host manager
-	reloadCfg := func() (*appconfig.AppConfig, error) {
+	reloadCfg := func() (*appconfig.AppConfig, []string, error) {
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
 		newCfg, _, err := appconfig.Load(cfgPath, extraDirs)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if newCfg.HasEncryptedPasswords() {
 			if key == "" {
-				return nil, errors.New("配置中包含加密密码，但未提供解密密钥")
+				return nil, nil, errors.New("配置中包含加密密码，但未提供解密密钥")
 			}
 			if err := newCfg.DecryptPasswords(key); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
-		if err := rebuildHosts(newCfg); err != nil {
-			return nil, err
+		changed, err := rebuildHosts(newCfg)
+		if err != nil {
+			return nil, nil, err
 		}
 		appCfg = newCfg
-		return newCfg, nil
+		return newCfg, changed, nil
 	}
 
 	srv := server.New(server.Options{
@@ -187,10 +194,13 @@ func main() {
 				return
 			case <-sigCh:
 				log.Printf("收到 SIGHUP，正在重新加载配置...")
-				if newCfg, err := reloadCfg(); err != nil {
+				if newCfg, changed, err := reloadCfg(); err != nil {
 					log.Printf("配置重载失败: %v", err)
 				} else {
 					srv.UpdateAuth(newCfg.Auth)
+					if n := srv.NotifyHostsChanged(changed); n > 0 {
+						log.Printf("已通知 %d 个连接因主机配置变更重连", n)
+					}
 					log.Printf("配置重载成功，共 %d 台机器", len(newCfg.Hosts))
 				}
 			}
@@ -198,7 +208,7 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("LogViewer 启动，访问 http://%s", displayAddr)
+		log.Printf("LogViewer %s 启动，访问 http://%s", version, displayAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("服务启动失败: %v", err)
 		}
@@ -256,7 +266,7 @@ func buildHosts(appCfg *appconfig.AppConfig, cfgPath string) ([]host.Host, error
 	}
 
 	localCfg := appCfg.Hosts["local"]
-	local, err := host.NewLocalHost("local", localCfg.Dirs, localCfg.Configs, saveCfgFor("local"))
+	local, err := host.NewLocalHost("local", localCfg.Dirs, localCfg.FileExtensions, localCfg.Configs, saveCfgFor("local"))
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +276,7 @@ func buildHosts(appCfg *appconfig.AppConfig, cfgPath string) ([]host.Host, error
 		if name == "local" || hc.SSH == nil {
 			continue
 		}
-		sh, err := host.NewSSHHost(name, *hc.SSH, hc.Platform, hc.Dirs, hc.Configs, saveCfgFor(name))
+		sh, err := host.NewSSHHost(name, *hc.SSH, hc.Platform, hc.Dirs, hc.FileExtensions, hc.Configs, saveCfgFor(name))
 		if err != nil {
 			return nil, fmt.Errorf("初始化机器 %q 失败: %w", name, err)
 		}
@@ -285,13 +295,13 @@ func buildHostManager(appCfg *appconfig.AppConfig, cfgPath string) (*host.Manage
 }
 
 // rebuildHostManager 根据新配置重建 Manager 中的主机集合，保留未变更的主机。
-func rebuildHostManager(hm *host.Manager, newCfg *appconfig.AppConfig, cfgPath string) error {
+// 返回被替换/移除的主机别名。
+func rebuildHostManager(hm *host.Manager, newCfg *appconfig.AppConfig, cfgPath string) ([]string, error) {
 	hosts, err := buildHosts(newCfg, cfgPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	hm.Rebuild(hosts)
-	return nil
+	return hm.Rebuild(hosts), nil
 }
 
 func dirsOf(hm *host.Manager, name string) []string {

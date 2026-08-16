@@ -11,7 +11,7 @@ import (
 
 func newTestLocal(t *testing.T, dirs ...string) *LocalHost {
 	t.Helper()
-	h, err := NewLocalHost("local", dirs, config.NewConfigStore(), nil)
+	h, err := NewLocalHost("local", dirs, nil, config.NewConfigStore(), nil)
 	if err != nil {
 		t.Fatalf("NewLocalHost: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestLsFiltersExtensions(t *testing.T) {
 
 func TestHostManager(t *testing.T) {
 	root := t.TempDir()
-	local, _ := NewLocalHost("local", []string{root}, config.NewConfigStore(), nil)
+	local, _ := NewLocalHost("local", []string{root}, nil, config.NewConfigStore(), nil)
 	m, err := NewManager(local)
 	if err != nil {
 		t.Fatal(err)
@@ -141,5 +141,89 @@ func TestHostManager(t *testing.T) {
 	}
 	if len(m.List()) != 1 || m.List()[0].Name != "local" {
 		t.Errorf("List: %+v", m.List())
+	}
+}
+
+func TestLsCustomExtensions(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []string{"a.log", "b.txt", "c.json", "noext"} {
+		if err := os.WriteFile(filepath.Join(root, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 自定义后缀：只显示 .txt
+	h, err := NewLocalHost("local", []string{root}, []string{"txt"}, config.NewConfigStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := h.Ls(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, n := range nodes {
+		names[n.Name] = true
+	}
+	if !names["b.txt"] {
+		t.Errorf(".txt 应显示: %v", names)
+	}
+	if names["a.log"] || names["c.json"] || names["noext"] {
+		t.Errorf("非 .txt 文件应隐藏: %v", names)
+	}
+
+	// "*" 展示所有文件（含无后缀）
+	hall, err := NewLocalHost("local", []string{root}, []string{"*"}, config.NewConfigStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes2, _ := hall.Ls(root)
+	all := map[string]bool{}
+	for _, n := range nodes2 {
+		all[n.Name] = true
+	}
+	for _, want := range []string{"a.log", "b.txt", "c.json", "noext"} {
+		if !all[want] {
+			t.Errorf("showAll 下 %s 应显示: %v", want, all)
+		}
+	}
+
+	// 后缀自动补点且大小写不敏感
+	h2, err := NewLocalHost("local", []string{root}, []string{"JSON"}, config.NewConfigStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes3, _ := h2.Ls(root)
+	found := false
+	for _, n := range nodes3 {
+		if n.Name == "c.json" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("'JSON' 应匹配 c.json")
+	}
+}
+
+func TestNormalizeExts(t *testing.T) {
+	set, all := normalizeExts(nil)
+	if all {
+		t.Error("nil 不应是 showAll")
+	}
+	if !set[".log"] || !set[".out"] {
+		t.Errorf("nil 应回退默认 .log/.out: %v", set)
+	}
+
+	set, all = normalizeExts([]string{"*"})
+	if !all {
+		t.Error("含 * 应 showAll")
+	}
+	if set != nil {
+		t.Errorf("showAll 时 set 应为 nil")
+	}
+
+	set, _ = normalizeExts([]string{" TXT ", "json"})
+	if !set[".txt"] || !set[".json"] {
+		t.Errorf("应补点并小写去空白: %v", set)
 	}
 }

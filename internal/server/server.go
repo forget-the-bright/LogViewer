@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +22,9 @@ type Options struct {
 	Static     fs.FS
 	Auth       appconfig.AuthConfig
 	ConfigPath string
-	ReloadFunc func() (*appconfig.AppConfig, error)
+	// ReloadFunc 热加载配置：返回新配置、本次被替换/移除的主机别名列表、错误。
+	// 返回的 changed 别名用于通知这些主机上的活跃 WS 连接重连到新实例。
+	ReloadFunc func() (cfg *appconfig.AppConfig, changedHosts []string, err error)
 }
 
 // Server 聚合后端各模块。文件/命令操作全部通过 Host 抽象完成，
@@ -32,7 +35,13 @@ type Server struct {
 	static     fs.FS
 	auth       *authService
 	configPath string
-	reloadFn   func() (*appconfig.AppConfig, error)
+	// reloadFn 热加载配置，返回新配置、被替换/移除的主机别名列表、错误。
+	reloadFn func() (cfg *appconfig.AppConfig, changedHosts []string, err error)
+
+	// wsMu 保护 wsClients：记录每个连接绑定的 host 别名，用于热加载替换主机时
+	// 通知对应连接重连（拿到新 Host 实例）。
+	wsMu      sync.Mutex
+	wsClients map[*wsClient]string
 }
 
 // New 创建 Server。
@@ -44,7 +53,50 @@ func New(opts Options) *Server {
 		auth:       newAuthService(opts.Auth),
 		configPath: opts.ConfigPath,
 		reloadFn:   opts.ReloadFunc,
+		wsClients:  map[*wsClient]string{},
 	}
+}
+
+// registerClient 记录一个 WS 连接与其绑定的主机别名。
+func (s *Server) registerClient(cl *wsClient, hostName string) {
+	s.wsMu.Lock()
+	s.wsClients[cl] = hostName
+	s.wsMu.Unlock()
+}
+
+// unregisterClient 移除连接记录。
+func (s *Server) unregisterClient(cl *wsClient) {
+	s.wsMu.Lock()
+	delete(s.wsClients, cl)
+	s.wsMu.Unlock()
+}
+
+// NotifyHostsChanged 通知所有绑定到给定主机别名的 WS 连接：主机配置已热更，
+// 需重连以绑定到新的 Host 实例（旧实例随后会被 Close 回收）。
+// 返回被通知的连接总数。changed 为 Rebuild 返回的被替换/移除主机别名。
+func (s *Server) NotifyHostsChanged(changed []string) int {
+	if len(changed) == 0 {
+		return 0
+	}
+	// 先收集每个主机名下的连接（持锁时间尽量短），再在锁外发送/关闭。
+	s.wsMu.Lock()
+	byName := map[string][]*wsClient{}
+	for cl, name := range s.wsClients {
+		byName[name] = append(byName[name], cl)
+	}
+	s.wsMu.Unlock()
+
+	n := 0
+	for _, hostName := range changed {
+		for _, cl := range byName[hostName] {
+			// 下发 reconnect 指令：前端收到后重连，/ws?host= 会拿到新实例。
+			// 旧进程随连接关闭被 stopSession 回收，避免继续持有即将被 Close 的旧 Host。
+			s.sendText(cl, `{"type":"reconnect","reason":"host_reloaded"}`)
+			_ = cl.conn.Close()
+			n++
+		}
+	}
+	return n
 }
 
 // Auth 暴露认证服务（供 main 打印启用状态）。
@@ -194,12 +246,14 @@ func (s *Server) handleReload(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "服务器未配置热加载功能"})
 		return
 	}
-	newCfg, err := s.reloadFn()
+	newCfg, changed, err := s.reloadFn()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "配置重载失败: " + err.Error()})
 		return
 	}
 	s.UpdateAuth(newCfg.Auth)
+	// 配置变更的主机：通知其活跃 WS 连接重连到新实例（在响应返回后触发）。
+	go s.NotifyHostsChanged(changed)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":    true,
 		"hosts": s.hosts.List(),

@@ -150,7 +150,7 @@ func newTestSSHHost(t *testing.T, addr, root string) *SSHHost {
 		InsecureSkipHostKey: true,
 		ConnectTimeoutSeconds: 5,
 		KeepAliveSeconds:    5,
-	}, "", []string{root}, config.NewConfigStore(), nil)
+	}, "", []string{root}, nil, config.NewConfigStore(), nil)
 	if err != nil {
 		t.Fatalf("NewSSHHost 失败: %v", err)
 	}

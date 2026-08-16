@@ -1,8 +1,9 @@
 // Package appconfig 负责 logviewer.json 的加载、生成、迁移与持久化。
 //
-// 配置文件支持 JSONC 注释（// 与 /* */），便于人工阅读；但程序通过界面保存
-// 过滤预设时会用标准 encoding/json 重新序列化，注释会被移除——首次生成的模板
-// 顶部已对此作出说明。
+// 配置文件支持 JSONC 注释（// 与 /* */），便于人工阅读。所有程序化写回
+// （Web 保存过滤预设、加解密密码、迁移旧配置）都通过 hujson AST 字节拼接
+// 原位替换目标子树，保留文件其余部分的注释、格式以及注释掉的远程主机示例。
+// 只有异常回退（目标结构损坏无法定位）才会用标准 JSON 全量重写。
 package appconfig
 
 import (
@@ -150,10 +151,11 @@ type SSHConfig struct {
 
 // HostConfig 是一台机器（本机或远程）的配置。
 type HostConfig struct {
-	SSH      *SSHConfig          `json:"ssh,omitempty"`
-	Platform string              `json:"platform,omitempty"`
-	Dirs     []string           `json:"dirs"`
-	Configs  config.ConfigStore `json:"configs"`
+	SSH            *SSHConfig          `json:"ssh,omitempty"`
+	Platform       string              `json:"platform,omitempty"`
+	Dirs           []string            `json:"dirs"`
+	FileExtensions []string            `json:"file_extensions,omitempty"`
+	Configs        config.ConfigStore  `json:"configs"`
 }
 
 // Locate 按以下顺序查找配置文件：explicit → <exeDir>/logviewer.json → <cwd>/logviewer.json。
@@ -227,7 +229,9 @@ func Load(path string, extraDirs []string) (*AppConfig, string, error) {
 	return &cfg, abs, nil
 }
 
-// Save 把配置写回磁盘（JSON 缩进，原子替换）。文件权限 0600（含密码）。
+// Save 把配置写回磁盘（标准 JSON 缩进，原子替换）。
+// 注意：这会剥光文件中的所有注释，仅用于无注释可保留的场景（如异常回退）。
+// 需要保留注释的全量改写字段，请用 SpliceConfigValues。
 func Save(path string, cfg *AppConfig) error {
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -236,6 +240,23 @@ func Save(path string, cfg *AppConfig) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 	return writeFileAtomic(path, b, 0o600)
+}
+
+// PasswordFieldPointers 返回 cfg 中每个“可能被加密/解密、会发生变化”的密码字段的
+// JSON Pointer → 当前值。仅包含非空且非 bcrypt 哈希的字段（bcrypt 哈希从不参与
+// 加解密，值不变，无需回写）。供 -encrypt-config/-decrypt-config 用 SpliceConfigValues
+// 原位替换这些标量，从而保留文件其余部分的注释与注释掉的远程示例。
+func (c *AppConfig) PasswordFieldPointers() map[string]any {
+	m := map[string]any{}
+	if c.Auth.Password != "" && !IsBcryptHash(c.Auth.Password) {
+		m["/auth/password"] = c.Auth.Password
+	}
+	for name, h := range c.Hosts {
+		if h.SSH != nil && h.SSH.Password != "" && !IsBcryptHash(h.SSH.Password) {
+			m[fmt.Sprintf("/hosts/%s/ssh/password", escapeJSONPointer(name))] = h.SSH.Password
+		}
+	}
+	return m
 }
 
 func (c *AppConfig) applyDefaults() {
@@ -323,6 +344,17 @@ func (c *AppConfig) Validate() error {
 			}
 			if h.SSH.Password == "" {
 				return fmt.Errorf("机器 %q 的 ssh.password 不能为空（当前仅支持密码认证）", name)
+			}
+			// 0 表示"用默认值"（applyDefaults 会填成 22/10/30），予以放行；
+			// 这里只拦截显式配错的越界值。
+			if h.SSH.Port < 0 || h.SSH.Port > 65535 {
+				return fmt.Errorf("机器 %q 的 ssh.port 非法: %d（应为 1-65535 或 0 用默认）", name, h.SSH.Port)
+			}
+			if h.SSH.ConnectTimeoutSeconds < 0 || h.SSH.ConnectTimeoutSeconds > 600 {
+				return fmt.Errorf("机器 %q 的 ssh.connect_timeout_seconds 非法: %d（应为 1-600 或 0 用默认）", name, h.SSH.ConnectTimeoutSeconds)
+			}
+			if h.SSH.KeepAliveSeconds < 0 || h.SSH.KeepAliveSeconds > 3600 {
+				return fmt.Errorf("机器 %q 的 ssh.keepalive_seconds 非法: %d（应为 1-3600 或 0 用默认）", name, h.SSH.KeepAliveSeconds)
 			}
 		}
 		switch h.Platform {

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,8 @@ type SSHHost struct {
 	sshCfg   appconfig.SSHConfig
 	dirs     []string // 远端根目录（按配置原样保留，不做本机 Abs）
 	platform string   // 配置显式指定的平台（空=自动探测）
+	exts     map[string]bool
+	showAll  bool // true 时展示所有文件（file_extensions 含 "*"）
 	cfgMgr   *config.Manager
 
 	mu            sync.Mutex
@@ -62,8 +65,9 @@ type SSHHost struct {
 }
 
 // NewSSHHost 构造一台远程机器 Host。initial/saveCfg 与 LocalHost 含义相同。
+// exts 控制目录树展示的文件后缀（nil=默认 .log/.out，含 "*" 展示全部）。
 func NewSSHHost(name string, sshCfg appconfig.SSHConfig, platform string, dirs []string,
-	initial config.ConfigStore, saveCfg config.SaveFunc) (*SSHHost, error) {
+	exts []string, initial config.ConfigStore, saveCfg config.SaveFunc) (*SSHHost, error) {
 	if name == "" {
 		return nil, errors.New("机器别名不能为空")
 	}
@@ -85,11 +89,14 @@ func NewSSHHost(name string, sshCfg appconfig.SSHConfig, platform string, dirs [
 			cleanDirs = append(cleanDirs, d)
 		}
 	}
+	extSet, showAll := normalizeExts(exts)
 	h := &SSHHost{
 		name:     name,
 		sshCfg:   sshCfg,
 		dirs:     cleanDirs,
 		platform: platform,
+		exts:     extSet,
+		showAll:  showAll,
 		cfgMgr:   config.NewManager(initial, saveCfg),
 	}
 	if len(cleanDirs) == 0 {
@@ -153,11 +160,27 @@ func (h *SSHHost) Info() Info {
 }
 
 // Fingerprint 返回主机的连接配置指纹，用于 Rebuild 时判断配置是否变更。
-// 包含名称 + host:port + username + password + key 相关参数。
+// 任何影响连接/行为/可见范围的字段都必须计入，否则热加载会静默保留旧实例：
+// 不仅是 host/port/user/password，还包括 dirs（可见目录）、platform（命令平台）、
+// 超时与保活参数。
 func (h *SSHHost) Fingerprint() string {
-	return fmt.Sprintf("%s|%s:%d|%s|%s|%s|%v",
+	// 后缀集合计入指纹，使 file_extensions 改动触发热加载替换实例。
+	var extToken string
+	if h.showAll {
+		extToken = "*"
+	} else {
+		exts := make([]string, 0, len(h.exts))
+		for e := range h.exts {
+			exts = append(exts, e)
+		}
+		sort.Strings(exts)
+		extToken = strings.Join(exts, ",")
+	}
+	return fmt.Sprintf("%s|%s:%d|%s|%s|%s|%v|plat=%s|dirs=%s|exts=%s|to=%d|ka=%d",
 		h.name, h.sshCfg.Host, h.sshCfg.Port, h.sshCfg.Username,
-		h.sshCfg.Password, h.sshCfg.KnownHostsFile, h.sshCfg.InsecureSkipHostKey)
+		h.sshCfg.Password, h.sshCfg.KnownHostsFile, h.sshCfg.InsecureSkipHostKey,
+		h.platform, strings.Join(h.dirs, ","), extToken,
+		h.sshCfg.ConnectTimeoutSeconds, h.sshCfg.KeepAliveSeconds)
 }
 
 // ---- 连接管理 ----
@@ -361,7 +384,9 @@ func (h *SSHHost) keepalive(stop chan struct{}) {
 			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 			if err != nil {
 				log.Printf("[ssh] %s: keepalive 失败，将重连: %v", h.name, err)
-				h.closeConn()
+				// 用比较拆除：仅当当前连接仍是这个失败的 client 时才关闭。
+				// 否则可能有在途操作已触发重连、换上了新连接，不能误杀。
+				h.invalidateConn(client)
 				return
 			}
 		}
@@ -389,6 +414,36 @@ func (h *SSHHost) closeConn() {
 	}
 }
 
+// invalidateConn 仅当当前存储的连接仍是 old 时才断开并清空。
+//
+// 并发安全问题：多个在途操作可能同时拿到同一个 client/sftp，当其中一个遇到连接
+// 错误时，若直接调用 closeConn()，会把"另一个 goroutine 已经触发重连、刚建好的
+// 新连接"也一起关掉，造成新连接被误杀、重试抖动。传入"失败时持有的那个旧连接"，
+// 只在它仍是当前连接时才关闭，已被替换则什么都不做。
+func (h *SSHHost) invalidateConn(old *ssh.Client) {
+	h.mu.Lock()
+	if h.client != old {
+		// 已被其他 goroutine 重连替换，不要误杀新连接。
+		h.mu.Unlock()
+		return
+	}
+	if h.stopKeepalive != nil {
+		close(h.stopKeepalive)
+		h.stopKeepalive = nil
+	}
+	sc := h.sftpClient
+	h.sftpClient = nil
+	h.client = nil
+	h.connected = false
+	h.mu.Unlock()
+	if sc != nil {
+		_ = sc.Close()
+	}
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
 // Close 释放资源（进程退出时调用）。
 func (h *SSHHost) Close() error {
 	h.closeOnce.Do(h.closeConn)
@@ -396,26 +451,33 @@ func (h *SSHHost) Close() error {
 }
 
 // withSFTP 拿到 sftp client 执行 fn；遇到连接错误自动重连一次。
+//
+// 重连用 invalidateConn(old) 而非无条件 closeConn：并发在途操作中，只有
+// "失败时仍持有旧连接"的那个 goroutine 负责拆除，避免误杀别人建好的新连接。
 func (h *SSHHost) withSFTP(fn func(*sftp.Client) error) error {
 	if err := h.ensureConnected(); err != nil {
 		return err
 	}
 	h.mu.Lock()
 	sc := h.sftpClient
+	cl := h.client
 	h.mu.Unlock()
 	if sc == nil {
 		return errors.New("SFTP 未连接")
 	}
 	err := fn(sc)
 	if err != nil && isConnErr(err) {
-		log.Printf("[ssh] %s: 操作失败，断开重连一次: %v", h.name, err)
-		h.closeConn()
+		log.Printf("[ssh] %s: SFTP 操作失败，断开重连一次: %v", h.name, err)
+		h.invalidateConn(cl)
 		if err2 := h.ensureConnected(); err2 != nil {
-			return err // 返回原始错误
+			return err // 重连失败返回原始连接错误
 		}
 		h.mu.Lock()
 		sc = h.sftpClient
 		h.mu.Unlock()
+		if sc == nil {
+			return err
+		}
 		err = fn(sc)
 	}
 	return err
@@ -440,8 +502,19 @@ func isConnErr(err error) bool {
 
 // ---- 平台探测 ----
 
-// detectPlatform 在远端执行 uname / ver 判断操作系统。
-// 不依赖登录 shell 的种类：优先 sh 风格的 uname，失败再试 Windows 的 cmd /c ver。
+// detectPlatform 在远端执行探测命令判断操作系统。
+//
+// 探测顺序不依赖登录 shell 种类：
+//   - uname -s：Linux/macOS 及带 uname 的环境（Git Bash/WSL）。
+//   - ver：Win32-OpenSSH 默认 shell 是 cmd.exe，裸 `ver` 是其内建命令，
+//     可正常输出 "Microsoft Windows [版本 ...]"。注意不能用 `cmd /c ver`：
+//     sshd 已用默认 shell 包了一层，再嵌套 `cmd /c ver` 会触发 cmd 的引号
+//     处理 bug，报 `'ver"' 不是内部或外部命令`（已在真实 Windows OpenSSH 上验证）。
+//   - powershell 兜底：若默认 shell 被改成 PowerShell（裸 ver 不可用），
+//     用 .NET 查询平台标识，"Win32NT" 即 Windows。
+//
+// Windows 的 ver 输出在中文系统下是 GBK 编码，但 "Windows" 是 ASCII 字节，
+// 用大小写不敏感的子串匹配即可跨代码页稳定命中。
 func detectPlatform(client *ssh.Client) (string, error) {
 	if out, err := runRemote(client, "uname -s"); err == nil {
 		switch strings.TrimSpace(string(out)) {
@@ -451,12 +524,23 @@ func detectPlatform(client *ssh.Client) (string, error) {
 			return "darwin", nil
 		}
 	}
-	if out, err := runRemote(client, "cmd /c ver"); err == nil {
-		if strings.Contains(strings.ToLower(string(out)), "windows") {
+	if out, err := runRemote(client, "ver"); err == nil {
+		if isWindowsOutput(out) {
 			return "windows", nil
 		}
 	}
-	return "", errors.New("uname 与 ver 均未识别出平台（远端可能是不支持的系统）")
+	if out, err := runRemote(client, `powershell -NoProfile -NonInteractive -Command "[Environment]::OSVersion.Platform]"`); err == nil {
+		if strings.Contains(strings.ToLower(string(out)), "win32nt") || isWindowsOutput(out) {
+			return "windows", nil
+		}
+	}
+	return "", errors.New("uname/ver/powershell 均未识别出平台（远端可能是不支持的系统）")
+}
+
+// isWindowsOutput 判断命令输出是否为 Windows 标识。"windows" 为 ASCII，
+// 即使远端输出是 GBK/UTF-16 也能稳定匹配到该子串。
+func isWindowsOutput(out []byte) bool {
+	return strings.Contains(strings.ToLower(string(out)), "windows")
 }
 
 // runRemote 在远端执行一条命令并返回 stdout。
@@ -546,4 +630,3 @@ func expandHome(p string) string {
 	}
 	return p
 }
-

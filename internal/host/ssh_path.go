@@ -228,7 +228,7 @@ func (h *SSHHost) ResolvePath(p string) (string, error) {
 	return "", &PathError{msg: "访问超出允许范围（符号链接逃逸）: " + p}
 }
 
-// Ls 列出单层子节点。目录全展示，文件只展示 .log/.out。
+// Ls 列出单层子节点。目录全展示，文件按配置的后缀过滤（默认 .log/.out）。
 func (h *SSHHost) Ls(dir string) ([]Node, error) {
 	abs, err := h.ResolvePath(dir)
 	if err != nil {
@@ -249,7 +249,7 @@ func (h *SSHHost) Ls(dir string) ([]Node, error) {
 	for _, info := range infos {
 		name := info.Name()
 		isDir := info.IsDir()
-		if !isDir && !allowedExts[strings.ToLower(extName(name))] {
+		if !isDir && !extAllow(name, h.exts, h.showAll) {
 			continue
 		}
 		child := remoteJoin(abs, name, sep)
@@ -259,8 +259,6 @@ func (h *SSHHost) Ls(dir string) ([]Node, error) {
 			IsDir:   isDir,
 			Size:    info.Size(),
 			ModTime: info.ModTime().Format(time.RFC3339),
-			// HasLog 需对每个子目录再发一次 ReadDir，SFTP 往返代价高，且前端暂未使用，省略。
-			HasLog: false,
 		}
 		nodes = append(nodes, n)
 	}
@@ -273,31 +271,25 @@ func (h *SSHHost) Ls(dir string) ([]Node, error) {
 	return nodes, nil
 }
 
-// Stat 返回远程文件信息。
+// Stat 返回远程文件信息。path 必须是 ResolvePath 已返回的规范化绝对路径；
+// 这里不再重复 ResolvePath（SSH 下会多一次 SFTP RealPath 往返）。
 func (h *SSHHost) Stat(path string) (os.FileInfo, error) {
-	abs, err := h.ResolvePath(path)
-	if err != nil {
-		return nil, err
-	}
 	var info os.FileInfo
-	err = h.withSFTP(func(sc *sftp.Client) error {
+	err := h.withSFTP(func(sc *sftp.Client) error {
 		var e error
-		info, e = sc.Stat(abs)
+		info, e = sc.Stat(path)
 		return e
 	})
 	return info, err
 }
 
 // Open 打开远程文件用于读取（原始下载）。调用方负责 Close。
+// path 必须是 ResolvePath 已返回的规范化绝对路径。
 func (h *SSHHost) Open(path string) (io.ReadCloser, error) {
-	abs, err := h.ResolvePath(path)
-	if err != nil {
-		return nil, err
-	}
 	var f *sftp.File
-	err = h.withSFTP(func(sc *sftp.Client) error {
+	err := h.withSFTP(func(sc *sftp.Client) error {
 		var e error
-		f, e = sc.Open(abs)
+		f, e = sc.Open(path)
 		return e
 	})
 	if err != nil {

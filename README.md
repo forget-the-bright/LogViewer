@@ -111,22 +111,26 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
 ## 从源码构建
 
+版本号唯一来源是根目录 `VERSION` 文件，通过 `-ldflags "-X main.version=..."` 注入。
+
 ```bash
 # 当前平台
-go build -o dist/logviewer .
+go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 
 # 交叉编译（示例：Linux amd64）
-GOOS=linux GOARCH=amd64 go build -o dist/logviewer .
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 ```
 
-Windows 下一键全平台打包（6 个目标：windows/linux/darwin × amd64/arm64）：
+> `VERSION` 只能由开发者本人手动修改，AI/自动化不得改动（见 [CLAUDE.md](CLAUDE.md)）。
+
+Windows 下一键全平台打包（自动读取 `VERSION`，6 个目标：windows/linux/darwin × amd64/arm64）：
 
 ```powershell
-# 注意：脚本里的 $MainPath 需与实际入口一致（本项目入口为根目录 main.go）
 .\build_all_platforms.ps1
 ```
 
-产物输出到 `dist/`。前端资源已嵌入二进制，部署时只需要拷贝单个可执行文件。
+产物输出到 `dist/`，包名形如 `logviewer-v0.0.4-linux-amd64.tar.gz`。前端资源已嵌入二进制，
+部署时只需要拷贝单个可执行文件。
 
 ---
 
@@ -135,14 +139,15 @@ Windows 下一键全平台打包（6 个目标：windows/linux/darwin × amd64/a
 ```
 LogViewer/
 ├── main.go                     # 入口：embed 静态资源、装载模块、启动 Gin
+├── VERSION                     # 版本号唯一来源（仅开发者手动修改）
 ├── go.mod / go.sum
-├── build_all_platforms.ps1     # 跨平台打包脚本
+├── build_all_platforms.ps1     # 跨平台打包脚本（从 VERSION 读版本号）
 ├── static/                     # 前端（embed 进二进制）
 │   ├── index.html
 │   ├── app.js
 │   ├── style.css
 │   └── vendor/                 # xterm.js / flatpickr 本地 vendor，无需联网
-├── logviewer.json              # 运行时生成的配置文件（首次启动自动创建）
+├── logviewer.json              # 运行时生成的配置文件（首次启动自动创建，勿提交）
 ├── internal/
 │   ├── appconfig/              # logviewer.json 加载(JSONC)/生成/迁移/密码哈希/AST 局部补丁
 │   ├── cryptoutil/             # AES-256-GCM 配置密码加解密
@@ -151,20 +156,21 @@ LogViewer/
 │   ├── cmdbuild/               # 跨平台命令构建 + 过滤参数拼装
 │   ├── procmgr/                # 子进程管理：启动/读取/节流/杀进程组
 │   └── server/                 # Gin 路由 + 目录浏览 + 配置 API + 导出 + WebSocket + 热加载
-└── docs/                       # 设计与经验文档
+└── docs/                       # 设计与经验文档（含 CHANGELOG）
 ```
 
 ---
 
 ## 文档
 
+- [变更日志](docs/CHANGELOG.md)
 - [架构设计](docs/architecture.md)
 - [原生命令管道设计](docs/native-command-pipeline.md) —— "Go 只是外壳"的具体实现
 - [开发指南](docs/development.md)
 - [部署说明](docs/deployment.md)
 - [经验总结 / 踩坑记录](docs/lessons.md)
 - [产品体验建议清单](docs/product-suggestions.md)
-- [SSH 远程与登录设计](SSH远程与登录设计.md) —— 多机器/SSH 与登录认证均已实现
+- [SSH 远程与登录设计](SSH远程与登录设计.md) —— 设计记录（多机器/SSH 与登录认证均已实现）
 
 ---
 

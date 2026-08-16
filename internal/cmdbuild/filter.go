@@ -51,32 +51,82 @@ func AssemblePattern(rule config.FilterRule, useRegex bool) string {
 	return strings.Join(parts, ".*")
 }
 
-// TimeBounds 按时间粒度把界面输入规整为闭区间 [start, end]（秒级字符串）。
-// 返回 ("","") 表示未设置时间过滤。
+// TimeBounds 按时间粒度把界面输入规整为时间区间（秒级字符串）。
+// 返回 start/end，任一可能为空字符串，表示该侧无界（开区间）；ok=false 表示
+// 完全未设置或输入非法（不应启用时间过滤）。
+//
+// 支持单边范围（根治旧版"只填一端就整条过滤失效"的问题）：
+//   - 只填起点：保留 t >= start 的行
+//   - 只填终点：保留 t <= end 的行
+//   - 两端都填：闭区间 [start, end]
+//
+// 粒度对齐（各自独立）：
 //   - day：起点补 00:00:00，终点补 23:59:59
 //   - hour：起点补 :00:00，终点补 :59:59
 //   - minute：起点补 :00，终点补 :59
 //   - second：原样（输入已到秒）
-//
-// 端点支持只填到日/时/分，按粒度补齐。
-func TimeBounds(rule config.FilterRule) (string, string, bool) {
-	if strings.TrimSpace(rule.TimeStart) == "" && strings.TrimSpace(rule.TimeEnd) == "" {
+func TimeBounds(rule config.FilterRule) (start string, end string, ok bool) {
+	sStr := strings.TrimSpace(rule.TimeStart)
+	eStr := strings.TrimSpace(rule.TimeEnd)
+	if sStr == "" && eStr == "" {
 		return "", "", false
 	}
 	prec := rule.TimePrecision
 	if prec == "" {
 		prec = "second"
 	}
-	start, ok1 := parseFlexibleTime(rule.TimeStart)
-	end, ok2 := parseFlexibleTime(rule.TimeEnd)
-	if !ok1 || !ok2 {
+	var startT, endT time.Time
+	var hasStart, hasEnd bool
+	if sStr != "" {
+		t, parseOK := parseFlexibleTime(sStr)
+		if !parseOK {
+			return "", "", false
+		}
+		startT = snapBound(t, prec, false)
+		hasStart = true
+	}
+	if eStr != "" {
+		t, parseOK := parseFlexibleTime(eStr)
+		if !parseOK {
+			return "", "", false
+		}
+		endT = snapBound(t, prec, true)
+		hasEnd = true
+	}
+	// 两端都填且终点早于起点：非法区间，不启用过滤。
+	if hasStart && hasEnd && endT.Before(startT) {
 		return "", "", false
 	}
-	start, end = snapBounds(start, end, prec)
-	if end.Before(start) {
-		return "", "", false
+	if hasStart {
+		start = startT.Format(timeLayout)
 	}
-	return start.Format(timeLayout), end.Format(timeLayout), true
+	if hasEnd {
+		end = endT.Format(timeLayout)
+	}
+	return start, end, true
+}
+
+// snapBound 按粒度对齐单个端点：起点向下取整到段首，终点向上取整到段尾。
+func snapBound(t time.Time, precision string, isEnd bool) time.Time {
+	y, mo, d := t.Date()
+	switch precision {
+	case "day":
+		if isEnd {
+			return time.Date(y, mo, d, 23, 59, 59, 0, time.Local)
+		}
+		return time.Date(y, mo, d, 0, 0, 0, 0, time.Local)
+	case "hour":
+		if isEnd {
+			return time.Date(y, mo, d, t.Hour(), 59, 59, 0, time.Local)
+		}
+		return time.Date(y, mo, d, t.Hour(), 0, 0, 0, time.Local)
+	case "minute":
+		if isEnd {
+			return time.Date(y, mo, d, t.Hour(), t.Minute(), 59, 0, time.Local)
+		}
+		return time.Date(y, mo, d, t.Hour(), t.Minute(), 0, 0, time.Local)
+	}
+	return t
 }
 
 func levelRegex(levels []string) string {
@@ -128,22 +178,3 @@ func parseFlexibleTime(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// snapBounds 按粒度把 start 向下取整、end 向上取整到整段。
-func snapBounds(start, end time.Time, precision string) (time.Time, time.Time) {
-	y, mo, d := start.Date()
-	switch precision {
-	case "day":
-		start = time.Date(y, mo, d, 0, 0, 0, 0, time.Local)
-		ey, emo, ed := end.Date()
-		end = time.Date(ey, emo, ed, 23, 59, 59, 0, time.Local)
-	case "hour":
-		start = time.Date(y, mo, d, start.Hour(), 0, 0, 0, time.Local)
-		ey, emo, ed := end.Date()
-		end = time.Date(ey, emo, ed, end.Hour(), 59, 59, 0, time.Local)
-	case "minute":
-		start = time.Date(y, mo, d, start.Hour(), start.Minute(), 0, 0, time.Local)
-		ey, emo, ed := end.Date()
-		end = time.Date(ey, emo, ed, end.Hour(), end.Minute(), 59, 0, time.Local)
-	}
-	return start, end
-}

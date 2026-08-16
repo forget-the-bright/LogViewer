@@ -9,33 +9,67 @@ import (
 	"logviewer/internal/config"
 )
 
-// handleConfigPreview 返回时间范围与匹配正则的可读拼装（用于前端实时预览）。
+// handleConfigPreview 返回时间范围与匹配正则的可读拼装（用于前端实时预览），
+// 并在目标机器的原生引擎上做空跑语法校验，把正则错误实时反馈给用户。
 func (s *Server) handleConfigPreview(c *gin.Context) {
+	h, ok := s.hostFrom(c)
+	if !ok {
+		return
+	}
 	var req struct {
-		FilterRule config.FilterRule `json:"FilterRule"`
-		UseRegex   bool              `json:"UseRegex"`
+		FilterRule    config.FilterRule `json:"FilterRule"`
+		UseRegex      bool              `json:"UseRegex"`
+		CaseSensitive bool              `json:"CaseSensitive"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: " + err.Error()})
 		return
 	}
-	var timeDesc, pattern string
-	if req.UseRegex && req.FilterRule.CustomRegex != "" {
-		pattern = req.FilterRule.CustomRegex
-	} else {
-		ts, te, ok := cmdbuild.TimeBounds(req.FilterRule)
-		if ok {
-			timeDesc = ts + "  ~  " + te
-		}
-		pattern = cmdbuild.AssemblePattern(req.FilterRule, req.UseRegex)
+
+	ts, te, _ := cmdbuild.TimeBounds(req.FilterRule)
+	f := cmdbuild.FilterCfg{
+		Pattern:       cmdbuild.AssemblePattern(req.FilterRule, req.UseRegex),
+		Exclude:       req.FilterRule.Exclude,
+		TimeStart:     ts,
+		TimeEnd:       te,
+		UseRegex:      req.UseRegex,
+		CaseSensitive: req.CaseSensitive,
 	}
+	if req.UseRegex && req.FilterRule.CustomRegex != "" {
+		f.TimeStart, f.TimeEnd = "", ""
+	}
+
+	// 实时正则校验（在用户停顿 150ms 后触发）：仅正则模式需要——非正则模式下
+	// 内容/级别均经 QuoteMeta 转义，排除走字面量，模式必然合法。
+	// 非法时仍返回拼装结果，但带上 regexError，前端据此把输入框标红并展示错误。
+	var regexError string
+	if req.UseRegex {
+		if msg := validateFilter(h, f); msg != "" {
+			regexError = msg
+		}
+	}
+
+	var timeDesc string
+	switch {
+	case f.TimeStart != "" && f.TimeEnd != "":
+		timeDesc = f.TimeStart + "  ~  " + f.TimeEnd
+	case f.TimeStart != "":
+		timeDesc = f.TimeStart + "  ~  (无终点)"
+	case f.TimeEnd != "":
+		timeDesc = "(无起点)  ~  " + f.TimeEnd
+	}
+	pattern := f.Pattern
 	if pattern == "" {
 		pattern = "(无内容正则)"
 	}
-	if timeDesc == "" && req.FilterRule.CustomRegex == "" {
+	if timeDesc == "" {
 		timeDesc = "(不限时间)"
 	}
-	c.JSON(http.StatusOK, gin.H{"pattern": pattern, "timeRange": timeDesc})
+	c.JSON(http.StatusOK, gin.H{
+		"pattern":    pattern,
+		"timeRange":  timeDesc,
+		"regexError": regexError,
+	})
 }
 
 func (s *Server) handleConfigList(c *gin.Context) {

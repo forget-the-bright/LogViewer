@@ -5,15 +5,33 @@
   // ---------- 状态 ----------
   const state = {
     ws: null,
+    wsGen: 0,            // WebSocket 代次：每次 connectWS 自增，用于回调守卫
     wsIntendedClose: false,
+    reconnecting: false, // 服务器要求重连（主机热更）：抑制离线横幅、立即重连
     connected: false,
     running: false,
     stopping: false,
+    waiting: false,      // follow 目标文件暂不存在，服务端等待中
     paused: false,
     pausedBuffer: [],
+    pausedBufferChars: 0, // pausedBuffer 的总字符数
+    pausedDropped: 0, // 暂停期间因缓冲超限被丢弃的字符数
     currentFile: "",
     selectedNode: null,
+    activeConfig: null,   // 最近一次 start 使用的配置（断线重连自动恢复用）
+    pendingResume: null,  // 连接建立后需要自动重发的 {filePath, config}
   };
+
+  // 统一复位暂停相关状态：切换文件/主机、断线、停止、开始时都必须调用，
+  // 否则暂停缓冲里的旧日志会在新视图继续输出、"继续"按钮状态也会错乱。
+  function resetPauseState() {
+    state.paused = false;
+    state.pausedBuffer = [];
+    state.pausedBufferChars = 0;
+    state.pausedDropped = 0;
+    const pb = $("pauseBtn");
+    if (pb) pb.textContent = "暂停";
+  }
 
   // WebSocket 指数退避重连
   const RECONNECT_BASE = 1000;
@@ -21,7 +39,9 @@
   let reconnectDelay = RECONNECT_BASE;
   let reconnectTimer = null;
 
-  const MAX_PAUSED_BUFFER = 5000; // 暂停期间最多缓冲行数
+  // 暂停期间最多缓冲的字符数。按平均每行 ~200 字符折算，约 5000 行的量级；
+  // 超出后丢弃最旧的数据，避免长时间暂停 + 高频日志撑爆浏览器内存。
+  const MAX_PAUSED_BUFFER_CHARS = 5000 * 200;
   const HIGHLIGHT_ANSI = "\x1b[97;48;5;160m"; // 白字红底
   const RESET_ANSI = "\x1b[0m";
 
@@ -135,8 +155,12 @@
   let term = null;
   let gutter = null;
   let fitAddon = null;
-  let gutterFit = null;
-  let gutterMirroredRows = 0; // gutter 已镜像的主终端缓冲区行数（含换行续行）
+  let searchAddon = null;
+  // 镜像游标：mirrorEndAbs 是"已镜像到的主终端绝对行号"（baseY+length 坐标系）。
+  // 不能用单调递增的"已镜像行数"去和 buf.length 比——缓冲区超过 scrollback 后
+  // 旧行被淘汰、buf.length 封顶，该计数会永久大于 length，导致行号栏彻底冻结。
+  // baseY 会随淘汰前移，用它计算新增行数可正确跨越封顶。
+  let mirrorEndAbs = 0;
   let logicalNo = 0;          // 逻辑行号（仅非续行递增）
 
   function makeTerm(opts) {
@@ -146,6 +170,11 @@
       convertEol: false,
       fontFamily: 'Consolas, "Courier New", monospace',
       disableStdin: true,
+      // search addon 的匹配高亮依赖 registerDecoration 装饰 API；
+      // 此版本 xterm 将其列为 proposed API，不显式开启会抛
+      // "You must set the allowProposedApi option to true"，
+      // 导致 findNext 静默失败、Ctrl+F 搜索完全无效。
+      allowProposedApi: true,
     }, opts));
   }
 
@@ -155,6 +184,12 @@
     term.loadAddon(fitAddon);
     term.open($("terminal"));
 
+    // 终端内搜索（xterm-addon-search）。UMD 挂在 window.SearchAddon，类为 .SearchAddon。
+    if (window.SearchAddon && window.SearchAddon.SearchAddon) {
+      searchAddon = new window.SearchAddon.SearchAddon();
+      term.loadAddon(searchAddon);
+    }
+
     // 行号栏：只读、无光标、不响应滚轮（由主终端滚动同步驱动）
     gutter = makeTerm({
       cursorBlink: false,
@@ -162,8 +197,8 @@
       scrollback: SCROLLBACK,
       theme: { background: "#181818", foreground: "#6a6a6a", cursor: "#6a6a6a" },
     });
-    gutterFit = new FitAddon.FitAddon();
-    gutter.loadAddon(gutterFit);
+    // 行号栏宽度固定（GUTTER_COLS），高度由主终端 fit 后用 gutter.resize 同步，
+    // 不需要 FitAddon（否则会按父容器拉伸宽度，与固定列宽冲突）。
     gutter.open($("gutter"));
     // 行号栏不处理鼠标滚轮/点击，让事件落到主终端
     $("gutter").style.pointerEvents = "none";
@@ -182,6 +217,13 @@
       gutter.resize(GUTTER_COLS, term.rows);
       rebuildGutter();
     } catch (e) { /* 容器尺寸为 0 时忽略 */ }
+  }
+
+  // 清空主终端、行号栏与搜索高亮（开始/停止/清空/切换主机时调用）。
+  function resetTerminal() {
+    if (term) term.reset();
+    if (searchAddon) { try { searchAddon.clearDecorations(); } catch (e) {} }
+    resetGutter();
   }
 
   // 主终端滚动 -> 用绝对位置同步行号栏（两条缓冲区行数 1:1，不会累积误差）
@@ -203,6 +245,11 @@
   // 增量镜像主终端缓冲区：每个新增的缓冲区行对应 gutter 一行；
   // 关键：长行折出的"续行"（isWrapped）不递增逻辑行号，在 gutter 中留空，
   // 这样两条终端行数严格 1:1，滚动同步不会错位。
+  //
+  // 用绝对行号（baseY 坐标系）而非单调计数来判断新增：缓冲区超出 scrollback
+  // 后旧行被淘汰、buf.length 封顶、baseY 前移。若用"已镜像行数 < length"比较，
+  // 一旦计数超过封顶的 length 就会永久停止镜像（行号栏冻结）。检测到淘汰时
+  // 直接整栏重建，未淘汰时按绝对位置增量追加，两种情况都正确。
   function syncGutter() {
     if (!gutter || !term) return;
     if (!$("lineNumToggle") || !$("lineNumToggle").checked) return;
@@ -210,15 +257,33 @@
     let n = buf.length;
     // 末尾光标所在的空行不镜像（gutter 自己也会有一个对应的空光标行）
     if (n > 0 && isTrailingEmptyRow(buf, n - 1)) n--;
+
+    const endAbs = buf.baseY + n; // 主终端最后一个有效行的绝对行号（exclusive）
+    if (endAbs < mirrorEndAbs) {
+      // 发生淘汰（baseY 前移到已镜像位置之前）：游标已失效，整栏重建。
+      rebuildGutter();
+      return;
+    }
+    if (endAbs === mirrorEndAbs) {
+      // 无新增，仅同步滚动位置。
+      const t = buf.viewportY;
+      if (gutter.buffer.active.viewportY !== t) gutter.scrollToLine(t);
+      return;
+    }
+
+    // 增量追加从 (mirrorEndAbs - baseY) 到 n 的缓冲区行。
     let chunk = "";
-    while (gutterMirroredRows < n) {
-      const line = buf.getLine(gutterMirroredRows);
+    let idx = mirrorEndAbs - buf.baseY;
+    if (idx < 0) { rebuildGutter(); return; }
+    while (idx < n) {
+      const line = buf.getLine(idx);
       const wrapped = !!(line && line.isWrapped);
       if (!wrapped) logicalNo++;
       const num = wrapped ? "" : String(logicalNo).padStart(GUTTER_COLS - 1);
       chunk += "\x1b[90m" + num + "\x1b[0m\r\n";
-      gutterMirroredRows++;
+      idx++;
     }
+    mirrorEndAbs = endAbs;
     if (chunk) gutter.write(chunk);
     // 绝对同步滚动位置
     const target = buf.viewportY;
@@ -227,18 +292,34 @@
 
   function resetGutter() {
     if (!gutter) return;
-    gutterMirroredRows = 0;
+    mirrorEndAbs = 0;
     logicalNo = 0;
     gutter.reset();
   }
 
-  // 从主终端当前缓冲区整行重建（切换显示、尺寸变化、重置后用）
+  // 从主终端当前缓冲区整行重建（切换显示、尺寸变化、重置后、淘汰后用）。
+  // 重建以"当前可视缓冲区第一行"为行号 1（重置后旧行已无意义），保证编号连续。
   function rebuildGutter() {
     if (!gutter || !term) return;
-    gutterMirroredRows = 0;
+    mirrorEndAbs = 0;
     logicalNo = 0;
     gutter.reset();
-    syncGutter();
+    if (!$("lineNumToggle") || !$("lineNumToggle").checked) return;
+    const buf = term.buffer.active;
+    let n = buf.length;
+    if (n > 0 && isTrailingEmptyRow(buf, n - 1)) n--;
+    let chunk = "";
+    for (let idx = 0; idx < n; idx++) {
+      const line = buf.getLine(idx);
+      const wrapped = !!(line && line.isWrapped);
+      if (!wrapped) logicalNo++;
+      const num = wrapped ? "" : String(logicalNo).padStart(GUTTER_COLS - 1);
+      chunk += "\x1b[90m" + num + "\x1b[0m\r\n";
+    }
+    mirrorEndAbs = buf.baseY + n;
+    if (chunk) gutter.write(chunk);
+    const target = buf.viewportY;
+    if (gutter.buffer.active.viewportY !== target) gutter.scrollToLine(target);
   }
 
   function setGutterVisible(visible) {
@@ -332,6 +413,13 @@
     if (!term) return;
     if (state.paused) {
       state.pausedBuffer.push(text);
+      state.pausedBufferChars += text.length;
+      // 超出上限：从队首丢弃最旧的数据，直到回到上限以内（至少保留最后一批）。
+      while (state.pausedBufferChars > MAX_PAUSED_BUFFER_CHARS && state.pausedBuffer.length > 1) {
+        const dropped = state.pausedBuffer.shift();
+        state.pausedBufferChars -= dropped.length;
+        state.pausedDropped += dropped.length;
+      }
       return;
     }
     // 逐行高亮（内容本身不含行号，行号由左侧 gutter 终端显示）
@@ -369,8 +457,10 @@
       opt.textContent = h.name + " [" + plat + "]" + status;
       sel.appendChild(opt);
     });
-    // 如果之前选中的主机已不存在，切回 local
-    if (sel.querySelector('option[value="' + prevHost + '"]')) {
+    // 如果之前选中的主机已不存在，切回 local。
+    // 用按 value 查找而非 querySelector 拼字符串：主机别名可能含引号等特殊字符，
+    // 拼进属性选择器会造成选择器注入/语法错误。
+    if (Array.from(sel.options).some((o) => o.value === prevHost)) {
       sel.value = prevHost;
     } else {
       sel.value = "local";
@@ -382,8 +472,13 @@
 
   // 自动刷新机器列表（不打断当前操作，仅静默更新下拉框状态文字）
   let hostsTimer = null;
+  let refreshingHosts = false;
   async function refreshHosts() {
     if (document.hidden) return;
+    // 在途锁：若上一次刷新仍未返回（网络慢/轮询间隔短），跳过本次，
+    // 避免并发请求的返回顺序错乱导致下拉框 DOM 互相覆盖。
+    if (refreshingHosts) return;
+    refreshingHosts = true;
     try {
       const data = await api("/api/hosts");
       const sel = $("hostSelect");
@@ -408,7 +503,7 @@
       });
       // 删除已不存在的主机选项
       Object.values(existing).forEach((o) => o.remove());
-      if (sel.querySelector('option[value="' + prevValue + '"]')) {
+      if (Array.from(sel.options).some((o) => o.value === prevValue)) {
         sel.value = prevValue;
       } else {
         sel.value = "local";
@@ -416,6 +511,8 @@
       }
     } catch (e) {
       // 静默失败：自动刷新不应打扰用户
+    } finally {
+      refreshingHosts = false;
     }
   }
 
@@ -426,7 +523,7 @@
       await loadHosts();
       // 如果当前主机仍存在，刷新其根目录和配置
       const sel = $("hostSelect");
-      if (sel.querySelector('option[value="' + currentHost + '"]')) {
+      if (Array.from(sel.options).some((o) => o.value === currentHost)) {
         await loadCapabilities();
         await loadRoots();
         await loadConfigList();
@@ -451,15 +548,15 @@
     applyCapabilities();
   }
 
-  // 根据远端能力禁用/启用 GBK 编码选项和时间过滤控件。
+  // 根据远端能力禁用/启用 GBK/GB2312 编码选项和时间过滤控件。
   function applyCapabilities() {
     const enc = $("encoding");
-    const gbkOpt = enc.querySelector('option[value="gbk"]');
-    if (gbkOpt) {
-      gbkOpt.disabled = !currentCaps.hasIconv;
-      gbkOpt.textContent = currentCaps.hasIconv ? "GBK" : "GBK（远端缺少 iconv）";
-    }
-    if (!currentCaps.hasIconv && enc.value === "gbk") {
+    enc.querySelectorAll('option[value="gbk"],option[value="gb2312"]').forEach((opt) => {
+      opt.disabled = !currentCaps.hasIconv;
+      const label = opt.value.toUpperCase();
+      opt.textContent = currentCaps.hasIconv ? label : label + "（远端缺少 iconv）";
+    });
+    if (!currentCaps.hasIconv && (enc.value === "gbk" || enc.value === "gb2312")) {
       enc.value = "utf-8";
     }
     const timeDisabled = !currentCaps.hasAwk;
@@ -489,12 +586,15 @@
     state.connected = false;
     state.running = false;
     state.stopping = false;
+    state.waiting = false;
+    state.pendingResume = null;
     state.currentFile = "";
+    state.activeConfig = null;
     setConnStatus("offline");
+    resetPauseState();
     treeEl.innerHTML = "";
     $("filePath").value = "";
-    if (term) term.reset();
-    resetGutter();
+    resetTerminal();
     try {
       await loadCapabilities();
       await loadRoots();
@@ -598,16 +698,23 @@
       return;
     }
     arrow.textContent = "▾";
-    if (!childrenEl.dataset.loaded) {
-      try {
-        const data = await api(hapi("/dir/list?path=" + encodeURIComponent(path)));
-        renderNodes(data.nodes, childrenEl);
-        childrenEl.dataset.loaded = "1";
-      } catch (e) {
-        toast(e.message, "error");
-      }
-    }
     childrenEl.style.display = "block";
+    // 防重复：加载中（dataset.loading）或已加载都不再发请求。
+    // 否则用户在请求返回前连续点击会并发发起多次 /dir/list。
+    if (childrenEl.dataset.loaded || childrenEl.dataset.loading) return;
+    childrenEl.dataset.loading = "1";
+    try {
+      const data = await api(hapi("/dir/list?path=" + encodeURIComponent(path)));
+      renderNodes(data.nodes, childrenEl);
+      childrenEl.dataset.loaded = "1";
+    } catch (e) {
+      toast(e.message, "error");
+      // 加载失败时折叠回去，允许重试
+      childrenEl.style.display = "none";
+      arrow.textContent = "▸";
+    } finally {
+      delete childrenEl.dataset.loading;
+    }
   }
 
   function selectFile(item, path, name) {
@@ -622,8 +729,10 @@
       wsSend({ action: "stop" });
       state.running = false;
       state.stopping = false;
-      if (term) term.reset();
-      resetGutter();
+      state.waiting = false;
+      state.pendingResume = null;
+      resetPauseState();
+      resetTerminal();
       setConnStatus("online");
       updateButtons();
       toast("已停止当前任务", "success");
@@ -725,8 +834,9 @@
   }
 
   // 正则/普通模式联动：
-  //   勾选正则 -> 显示构建器，隐藏文本框与反转
-  //   取消勾选 -> 隐藏构建器，显示文本框与反转（反转仅普通模式生效）
+  //   勾选正则 -> 显示构建器，隐藏纯文本框
+  //   取消勾选 -> 隐藏构建器，显示纯文本框
+  // 反转（grep -v / -NotMatch）在两种模式下都生效：后端对正则主模式同样支持 -vE。
   function applyRegexMode() {
     const on = $("useRegex").checked;
     $("configPanel").classList.toggle("regex-on", on);
@@ -734,8 +844,6 @@
       // 切回正则时，把普通文本框的值带到"内容包含"
       const p = $("plainContains").value.trim();
       if (p && !$("contains").value.trim()) $("contains").value = p;
-      // 正则模式反转不适用，强制取消
-      $("invertMatch").checked = false;
     } else {
       // 切到普通模式，把内容包含带到文本框
       const c = $("contains").value.trim();
@@ -762,7 +870,7 @@
       ReadLinesLimit: $("limitEnable").checked ? (parseInt($("readLines").value, 10) || 0) : 0,
       Encoding: $("encoding").value,
       CaseSensitive: $("caseSensitive").checked,
-      InvertMatch: useRegex ? false : $("invertMatch").checked,
+      InvertMatch: $("invertMatch").checked,
       ContextBefore: parseInt($("contextBefore").value, 10) || 0,
       ContextAfter: parseInt($("contextAfter").value, 10) || 0,
       UseRegex: useRegex,
@@ -819,12 +927,34 @@
         const data = await api(hapi("/config/preview"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ FilterRule: readForm().FilterRule, UseRegex: $("useRegex").checked }),
+          body: JSON.stringify({
+            FilterRule: readForm().FilterRule,
+            UseRegex: $("useRegex").checked,
+            CaseSensitive: $("caseSensitive").checked,
+          }),
         });
         const el = $("regexPreview");
         const timePart = data.timeRange ? "时间: " + data.timeRange : "";
         const rePart = data.pattern ? "正则: " + data.pattern : "";
         el.textContent = [timePart, rePart].filter(Boolean).join("   |   ") || "(无过滤，读取全部)";
+        // 正则校验错误：在预览区红字提示，并把对应输入框标红。
+        const errEl = $("regexError");
+        // 根据错误前缀定位到具体输入框（自定义正则优先级最高）。
+        let badField = null;
+        if ($("customRegex").value.trim()) badField = $("customRegex");
+        else if (data.regexError && data.regexError.indexOf("排除") >= 0) badField = $("exclude");
+        else if (data.regexError && data.regexError.indexOf("匹配") >= 0) badField = $("contains");
+        document.querySelectorAll(".input-error").forEach((n) => n.classList.remove("input-error"));
+        if (data.regexError) {
+          if (errEl) {
+            errEl.textContent = "⚠ " + data.regexError;
+            errEl.style.display = "";
+          }
+          if (badField) badField.classList.add("input-error");
+        } else if (errEl) {
+          errEl.textContent = "";
+          errEl.style.display = "none";
+        }
       } catch (e) {
         $("regexPreview").textContent = "预览失败: " + e.message;
       }
@@ -855,8 +985,13 @@
       start.disabled = true;
       stop.disabled = false;
       stop.textContent = follow ? "停止跟踪" : "中断";
+    } else if (state.waiting) {
+      // 等待目标文件产生：禁用"开始"避免重复提交，仍允许停止。
+      start.disabled = true;
+      stop.disabled = false;
+      stop.textContent = "取消等待";
     } else {
-      start.disabled = false;
+      start.disabled = !state.connected;
       stop.disabled = true;
       start.textContent = follow ? "开始跟踪" : "开始查看";
     }
@@ -915,6 +1050,30 @@
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   }
 
+  // probeAuthThenReconnect 在 WS 握手失败（从未 onopen）后探测认证状态：
+  // 已登录说明是网络/服务暂时不可达，走正常退避重连；未登录说明会话过期，
+  // 弹登录框并停止重连（登录成功后会主动 connectWS）。
+  async function probeAuthThenReconnect(gen) {
+    try {
+      const r = await fetch("/api/auth/status", { cache: "no-store" });
+      const data = r.ok ? await r.json().catch(() => ({})) : {};
+      // 回调时连接可能已被 switchHost/新 connectWS 取代，守卫避免乱入。
+      if (gen !== state.wsGen) return;
+      if (data.enabled && data.authed === false) {
+        showLogin();
+        return;
+      }
+    } catch (e) {
+      // auth/status 自身也不可达：按普通断线处理（可能服务整体没起来）。
+      if (gen !== state.wsGen) return;
+    }
+    if (!state.wsIntendedClose) {
+      const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
+      if (!loginShown) showDisconnectBanner();
+    }
+    scheduleReconnect();
+  }
+
   function scheduleReconnect() {
     if (reconnectTimer) return;
     const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
@@ -927,38 +1086,114 @@
   }
 
   function connectWS() {
+    // 先关闭可能存在的旧连接，避免"立即重连"在旧连接仍 CONNECTING 时
+    // 产生两个并存连接（onmessage 双写、onclose 互相覆盖状态）。
+    if (state.ws) {
+      try { state.ws.onopen = state.ws.onmessage = state.ws.onclose = state.ws.onerror = null; state.ws.close(); } catch (e) {}
+      state.ws = null;
+    }
+    const gen = ++state.wsGen;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(proto + "://" + location.host + "/ws?host=" + encodeURIComponent(currentHost));
     state.ws = ws;
+    // opened：本次连接是否曾成功握手。浏览器 WebSocket 拿不到 HTTP 401 状态码，
+    // 只能用"从未 onopen"来区分"会话过期导致的握手失败"与"连接中途断开"。
+    let opened = false;
+
+    // 代次守卫：任何异步回调（open/message/close/error）触发时，若它已不是
+    // 最新连接，就必须忽略，否则 switchHost 后旧连接的迟到 onclose 会误清
+    // 新连接状态、误弹断线横幅、再触发一次多余重连。
+    const stale = () => state.wsGen !== gen || state.ws !== ws;
 
     ws.onopen = () => {
+      if (stale()) return;
+      opened = true;
       state.connected = true;
+      state.waiting = false;
       reconnectDelay = RECONNECT_BASE;
       hideDisconnectBanner();
-      setConnStatus(state.running ? "running" : "online");
+      // 断线前若有正在跟踪的会话，重连后自动续跟，避免用户误以为日志仍在实时输出。
+      if (state.pendingResume) {
+        const resume = state.pendingResume;
+        state.pendingResume = null;
+        state.running = false;
+        state.stopping = false;
+        resetPauseState();
+        setConnStatus("online");
+        toast("连接已恢复，继续跟踪日志", "success");
+        wsSend({ action: "start", filePath: resume.filePath, config: resume.config });
+      } else {
+        setConnStatus(state.running ? "running" : "online");
+      }
+      // 连接建立后刷新按钮态：空闲时需要启用"开始"按钮（setupUI 时因
+      // 尚未连接将其禁用，而空闲连接不会收到 status 消息来再次触发刷新）。
+      updateButtons();
     };
     ws.onmessage = (ev) => {
+      if (stale()) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === "log") {
-        writeToTerminal(msg.data, readForm().HighlightRules);
+        writeToTerminal(msg.data, state.activeConfig ? state.activeConfig.HighlightRules : readForm().HighlightRules);
+      } else if (msg.type === "reconnect") {
+        // 服务器通知主机配置已热更：关闭当前连接，由 onclose 走重连流程
+        // 绑定到新实例。reconnecting 标记抑制离线横幅，pendingResume 由
+        // onclose 按运行状态保留，重连后自动恢复日志跟踪。
+        state.reconnecting = true;
+        try { state.ws.close(); } catch (e) {}
       } else if (msg.type === "error") {
         if (term) term.write("\x1b[91m[错误] " + msg.msg + "\x1b[0m\r\n");
         setConnStatus("online");
       } else if (msg.type === "status") {
-        if (msg.status === "running") { state.running = true; state.stopping = false; setConnStatus("running"); }
-        else if (msg.status === "stopped") { state.running = false; state.stopping = false; setConnStatus("online"); }
-        else if (msg.status === "waiting") { toast("等待日志文件产生..."); }
+        if (msg.status === "running") {
+          state.running = true; state.stopping = false; state.waiting = false;
+          setConnStatus("running");
+        } else if (msg.status === "stopped") {
+          state.running = false; state.stopping = false; state.waiting = false;
+          state.pendingResume = null;
+          resetPauseState();
+          setConnStatus("online");
+        } else if (msg.status === "waiting") {
+          state.waiting = true;
+          toast("等待日志文件产生...");
+        }
         updateButtons();
       }
     };
     ws.onclose = () => {
+      if (stale()) return;
       state.connected = false;
+      state.waiting = false;
+      // 正在读取/跟踪时断线：保留 pendingResume，重连成功后自动恢复；
+      // 否则清空运行态，避免 UI 停在"读取中"。
+      if (state.running || state.stopping) {
+        if (state.currentFile && state.activeConfig) {
+          state.pendingResume = { filePath: state.currentFile, config: state.activeConfig };
+        }
+      } else {
+        state.pendingResume = null;
+      }
       state.running = false;
       state.stopping = false;
+      resetPauseState();
       setConnStatus("offline");
       updateButtons();
-      // 若之前是连接状态，显示断线横幅（首次加载未连上时不显示）
+      // reconnecting=true 表示服务器主动要求重连（主机热更），抑制离线横幅，
+      // 立即重连而不是走退避，避免用户看到闪断。
+      if (state.reconnecting) {
+        state.reconnecting = false;
+        cancelReconnect();
+        reconnectDelay = RECONNECT_BASE;
+        connectWS();
+        return;
+      }
+      // 从未 onopen 且启用认证：浏览器拿不到 WS 的 401 状态码（握手前被拒直接
+      // close），此时探测一次 auth/status，区分"会话过期"与"服务暂不可达"。
+      // 会话过期应弹登录框、停止重连风暴，而不是无限退避重连。
+      if (!opened && authEnabled && !state.wsIntendedClose) {
+        probeAuthThenReconnect(gen);
+        return;
+      }
       if (!state.wsIntendedClose) {
         const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
         if (!loginShown) showDisconnectBanner();
@@ -966,6 +1201,7 @@
       scheduleReconnect();
     };
     ws.onerror = () => {
+      if (stale()) return;
       if (term) term.write("\x1b[91m[连接错误] WebSocket 连接异常，正在尝试重连...\x1b[0m\r\n");
       ws.close();
     };
@@ -974,27 +1210,41 @@
   function wsSend(obj) {
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
       state.ws.send(JSON.stringify(obj));
+      return true;
     }
+    return false;
   }
 
   function startView() {
     const file = $("filePath").value.trim();
     if (!file) { toast("请先在左侧选择日志文件", "error"); return; }
+    // 未连接时点开始：明确反馈并主动触发一次连接（不静默吞掉）。
+    if (!state.connected) {
+      toast("正在连接服务器，请稍后重试", "error");
+      cancelReconnect();
+      reconnectDelay = RECONNECT_BASE;
+      connectWS();
+      return;
+    }
     // 修改过滤参数后重新开始：先停掉后台旧命令，清空控制台与缓冲，再用新配置启动
     if (state.running || state.stopping) wsSend({ action: "stop" });
     state.stopping = false;
-    state.paused = false;
-    state.pausedBuffer = [];
-    $("pauseBtn").textContent = "暂停";
-    if (term) term.reset();
-    resetGutter();
-    wsSend({ action: "start", filePath: file, config: readForm() });
+    state.waiting = false;
+    resetPauseState();
+    resetTerminal();
+    const cfg = readForm();
+    state.currentFile = file;
+    state.activeConfig = cfg;
+    state.pendingResume = null;
+    wsSend({ action: "start", filePath: file, config: cfg });
   }
 
   function stopView() {
     // 立即进入"停止中"视觉态（非阻塞），不等服务端 stopped 回执，
     // 避免远程/本地查杀进程的几百毫秒让用户觉得"点了没反应"。
     state.stopping = true;
+    state.waiting = false;
+    state.pendingResume = null;
     setConnStatus("stopping");
     updateButtons();
     wsSend({ action: "stop" });
@@ -1012,6 +1262,7 @@
 
   // 导出遮罩：显示/更新进度，处理中禁用按钮
   let exporting = false;
+  let exportAbort = null; // 当前导出的 AbortController，取消按钮用
   function fmtBytes(n) {
     if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
     if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
@@ -1019,6 +1270,7 @@
   }
   function showExport(title) {
     exporting = true;
+    exportAbort = new AbortController();
     $("exportTitle").textContent = title;
     $("progressFill").style.width = "0%";
     $("exportPercent").textContent = "0%";
@@ -1026,6 +1278,12 @@
     $("exportMask").classList.add("show");
     $("exportRawBtn").disabled = true;
     $("exportFilterBtn").disabled = true;
+  }
+  function cancelExport() {
+    if (exportAbort) {
+      try { exportAbort.abort(); } catch (e) {}
+    }
+    $("exportStatus").textContent = "正在取消...";
   }
   function setExportProgress(received, total, done) {
     let pct;
@@ -1042,6 +1300,7 @@
   }
   function hideExport() {
     exporting = false;
+    exportAbort = null;
     $("exportMask").classList.remove("show");
     $("exportRawBtn").disabled = false;
     $("exportFilterBtn").disabled = false;
@@ -1056,10 +1315,17 @@
     return r;
   }
 
-  // 流式读取响应体，边下边显示进度（不依赖 Content-Length 也能显示已下载字节）
-  async function streamDownload(response) {
+  // 流式读取响应体，边下边显示进度（不依赖 Content-Length 也能显示已下载字节）。
+  // signal 来自 exportAbort：取消时 reader.cancel() 会中断底层连接，
+  // 服务端检测到客户端断开即 Kill 远端导出进程。
+  async function streamDownload(response, signal) {
     const total = parseInt(response.headers.get("Content-Length") || "0", 10);
     const reader = response.body.getReader();
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        try { reader.cancel(); } catch (e) {}
+      }, { once: true });
+    }
     const chunks = [];
     let received = 0;
     for (;;) {
@@ -1090,17 +1356,19 @@
   async function triggerRawDownload(file) {
     showExport("正在导出原始日志...");
     try {
-      const r = authCheck(await fetch(hapi("/file/download/origin?path=" + encodeURIComponent(file))));
+      const r = authCheck(await fetch(hapi("/file/download/origin?path=" + encodeURIComponent(file)),
+        { signal: exportAbort.signal }));
       if (!r.ok) {
         let msg = "导出失败 " + r.status;
         try { msg = (await r.json()).error || msg; } catch (e) {}
         throw new Error(msg);
       }
-      const blob = await streamDownload(r);
+      const blob = await streamDownload(r, exportAbort.signal);
       saveBlob(r, blob);
       setTimeout(hideExport, 400);
       toast("原始日志已导出", "success");
     } catch (e) {
+      if (e.name === "AbortError") { hideExport(); toast("已取消导出", ""); return; }
       hideExport();
       toast("导出失败: " + e.message, "error");
     }
@@ -1118,6 +1386,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(readForm()),
+          signal: exportAbort.signal,
         }
       ));
       if (!r.ok) {
@@ -1125,11 +1394,12 @@
         try { msg = (await r.json()).error || msg; } catch (e) {}
         throw new Error(msg);
       }
-      const blob = await streamDownload(r);
+      const blob = await streamDownload(r, exportAbort.signal);
       saveBlob(r, blob);
       setTimeout(hideExport, 400);
       toast("过滤日志已导出", "success");
     } catch (e) {
+      if (e.name === "AbortError") { hideExport(); toast("已取消导出", ""); return; }
       hideExport();
       toast("导出失败: " + e.message, "error");
     }
@@ -1157,13 +1427,13 @@
       if (root) await loadTreeDir(root, treeEl);
     }));
 
-    $("loadCfgBtn").addEventListener("click", loadSelectedConfig);
-    $("saveCfgBtn").addEventListener("click", () => saveConfig($("cfgName").value));
-    $("saveAsCfgBtn").addEventListener("click", () => {
+    $("loadCfgBtn").addEventListener("click", safeRun(loadSelectedConfig));
+    $("saveCfgBtn").addEventListener("click", safeRun(() => saveConfig($("cfgName").value)));
+    $("saveAsCfgBtn").addEventListener("click", safeRun(() => {
       const name = prompt("另存为配置名称：");
-      if (name) { $("cfgName").value = name; saveConfig(name); }
-    });
-    $("delCfgBtn").addEventListener("click", async () => {
+      if (name) { $("cfgName").value = name; return saveConfig(name); }
+    }));
+    $("delCfgBtn").addEventListener("click", safeRun(async () => {
       const name = $("configSelect").value;
       if (!name) return;
       if (!confirm("删除配置「" + name + "」？")) return;
@@ -1173,8 +1443,8 @@
       });
       await loadConfigList();
       toast("已删除", "success");
-    });
-    $("setDefaultCfgBtn").addEventListener("click", async () => {
+    }));
+    $("setDefaultCfgBtn").addEventListener("click", safeRun(async () => {
       const name = $("configSelect").value;
       if (!name) return;
       await api(hapi("/config/setdefault"), {
@@ -1182,7 +1452,20 @@
         body: JSON.stringify({ name }),
       });
       toast("已设为默认", "success");
-    });
+    }));
+    $("renameCfgBtn").addEventListener("click", safeRun(async () => {
+      const oldName = $("configSelect").value;
+      if (!oldName) return;
+      const newName = prompt("将配置「" + oldName + "」重命名为：", oldName);
+      if (!newName || newName.trim() === "" || newName === oldName) return;
+      await api(hapi("/config/rename"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ old: oldName, new: newName.trim() }),
+      });
+      $("cfgName").value = newName.trim();
+      await loadConfigList();
+      toast("已重命名", "success");
+    }));
 
     $("startBtn").addEventListener("click", () => { startView(); updateButtons(); });
     $("stopBtn").addEventListener("click", () => { stopView(); updateButtons(); });
@@ -1213,8 +1496,20 @@
     if (cfgTitle) cfgTitle.style.cursor = "pointer", cfgTitle.addEventListener("click", togglePanel);
 
     // 侧栏折叠 / 展开（带文字的醒目按钮）
+    // 注意：initSplitter/拖拽会给 treePanel 写入内联 width，其优先级高于
+    // 样式表的 .collapsed{width:0}，导致折叠无效。折叠时把内联 width 置 0，
+    // 展开时恢复记忆宽度（或移除内联宽度回到 CSS 默认 260px）。
+    let rememberedWidth = "";
     const setSidebar = (collapsed) => {
-      $("treePanel").classList.toggle("collapsed", collapsed);
+      const panel = $("treePanel");
+      if (collapsed) {
+        rememberedWidth = panel.style.width || rememberedWidth;
+        panel.classList.add("collapsed");
+        panel.style.width = "0px";
+      } else {
+        panel.classList.remove("collapsed");
+        panel.style.width = rememberedWidth || "";
+      }
       $("sidebarReopen").classList.toggle("show", collapsed);
       $("sidebarCollapse").textContent = collapsed ? "▶ 展开" : "◀ 收起";
       setTimeout(fitTerm, 80);
@@ -1248,21 +1543,41 @@
     $("pauseBtn").addEventListener("click", () => {
       state.paused = !state.paused;
       $("pauseBtn").textContent = state.paused ? "继续" : "暂停";
-      if (!state.paused && state.pausedBuffer.length) {
-        const rules = readForm().HighlightRules;
-        writeToTerminal(state.pausedBuffer.join(""), rules);
+      if (!state.paused) {
+        if (state.pausedDropped > 0) {
+          const approxLines = Math.round(state.pausedDropped / 120);
+          if (term) term.write("\x1b[33m[提示] 暂停期间缓冲已达上限，丢弃了约 " + approxLines + " 行较早的日志\x1b[0m\r\n");
+        }
+        if (state.pausedBuffer.length) {
+          const rules = readForm().HighlightRules;
+          writeToTerminal(state.pausedBuffer.join(""), rules);
+        }
         state.pausedBuffer = [];
+        state.pausedBufferChars = 0;
+        state.pausedDropped = 0;
       }
     });
-    $("clearBtn").addEventListener("click", () => { if (term) term.reset(); resetGutter(); });
+    $("clearBtn").addEventListener("click", () => { resetTerminal(); });
     $("lineNumToggle").addEventListener("change", (e) => {
       setGutterVisible(e.target.checked);
     });
-    $("copyBtn").addEventListener("click", () => {
+    $("copyBtn").addEventListener("click", safeRun(() => {
       const sel = term.getSelection();
-      if (sel) { navigator.clipboard.writeText(sel).then(() => toast("已复制", "success")); }
-      else toast("请先在终端中鼠标选中文本", "error");
-    });
+      if (!sel) { toast("请先在终端中鼠标选中文本", "error"); return; }
+      // navigator.clipboard 仅在安全上下文（HTTPS/localhost）下存在；
+      // 非安全 HTTP 访问时为 undefined，直接调用会抛错。用 textarea 兜底。
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(sel).then(() => toast("已复制", "success"));
+      }
+      const ta = document.createElement("textarea");
+      ta.value = sel;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); toast("已复制", "success"); }
+      finally { ta.remove(); }
+    }));
     $("exportRawBtn").addEventListener("click", () => {
       const file = $("filePath").value.trim();
       if (!file) { toast("请先选择日志文件", "error"); return; }
@@ -1273,6 +1588,9 @@
       if (!file) { toast("请先选择日志文件", "error"); return; }
       triggerFilteredDownload(file);
     });
+    $("exportCancelBtn").addEventListener("click", cancelExport);
+
+    initTerminalSearch();
 
     // 登录表单
     $("loginForm").addEventListener("submit", onLoginSubmit);
@@ -1280,6 +1598,94 @@
     $("logoutBtn").addEventListener("click", onLogout);
 
     initSplitter();
+  }
+
+  // ============ 终端内搜索 ============
+  function initTerminalSearch() {
+    const bar = $("searchBar");
+    const input = $("searchInput");
+    const caseBtn = $("searchCase");
+    const count = $("searchCount");
+    if (!bar || !input || !searchAddon) return;
+
+    let lastQuery = "";
+
+    function opts() {
+      return {
+        caseSensitive: caseBtn.checked,
+        // 整词/正则暂不暴露；decorations 让所有匹配带高亮
+        decorations: {
+          matchBackground: "#5a4a00",
+          matchBorder: "#ffcc00",
+          matchOverviewRuler: "#ffcc00",
+          activeMatchBackground: "#8a6d00",
+          activeMatchBorder: "#ffd84d",
+          activeMatchColor: "#ffffff",
+        },
+      };
+    }
+
+    function showFound(found) {
+      count.textContent = found ? "" : "无匹配";
+      count.className = "search-count" + (found ? "" : " none");
+    }
+
+    function doFind(forward) {
+      const q = input.value;
+      if (!q) { count.textContent = ""; return; }
+      // 查询变化时从头开始，避免从旧光标位置漏掉上方匹配
+      if (q !== lastQuery) {
+        searchAddon.clearDecorations?.();
+        term.clearSelection();
+        lastQuery = q;
+      }
+      let found = false;
+      try {
+        found = forward ? searchAddon.findNext(q, opts()) : searchAddon.findPrevious(q, opts());
+      } catch (e) {
+        // 非法正则（若启用 regex）等
+        found = false;
+      }
+      showFound(found);
+    }
+
+    function open() {
+      bar.style.display = "flex";
+      const sel = term && term.getSelection();
+      if (sel && sel.indexOf("\n") === -1) input.value = sel;
+      input.focus();
+      input.select();
+      lastQuery = "";
+      count.textContent = "";
+    }
+
+    function close() {
+      bar.style.display = "none";
+      searchAddon.clearDecorations?.();
+      if (term) term.focus();
+    }
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); doFind(!e.shiftKey); }
+      else if (e.key === "Escape") { e.preventDefault(); close(); }
+    });
+    // 输入变化时重置起点状态
+    input.addEventListener("input", () => { lastQuery = ""; count.textContent = ""; });
+    caseBtn.addEventListener("change", () => { lastQuery = ""; doFind(true); });
+
+    $("searchNext").addEventListener("click", () => doFind(true));
+    $("searchPrev").addEventListener("click", () => doFind(false));
+    $("searchClose").addEventListener("click", close);
+
+    // 全局 Ctrl+F / Cmd+F 唤起搜索
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        open();
+      } else if (e.key === "Escape" && bar.style.display !== "none" && document.activeElement === input) {
+        close();
+      }
+    });
   }
 
   // ============ 拖拽侧栏 ============

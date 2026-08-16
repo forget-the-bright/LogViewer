@@ -5,7 +5,9 @@ Go 跨平台一键编译打包脚本 - LogViewer 日志查看工具
 
 # ===================== 配置区（按需修改） =====================
 $ProjectName = "logviewer"
-$Version = "v0.0.1"
+# 版本号唯一来源是项目根目录的 VERSION 文件，只由开发者本人手动修改。
+$Version = (Get-Content -Path "$PSScriptRoot/VERSION" -Raw).Trim()
+if (-not $Version) { throw "无法从 VERSION 文件读取版本号" }
 # main.go 在项目根目录
 $MainPath = "."
 # 输出目录
