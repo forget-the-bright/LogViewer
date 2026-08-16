@@ -5,23 +5,34 @@ LogViewer 编译后是**单个自包含可执行文件**：前端 HTML/JS/CSS �
 
 ## 1. 构建
 
+### 版本号
+
+版本号唯一来源是项目根目录的 `VERSION` 文件，构建时通过
+`-ldflags "-X main.version=<version>"` 注入到二进制，启动日志会打印
+`LogViewer <version> 启动...`。**版本号只由开发者手动修改 `VERSION`，AI/自动化不得改动。**
+
 ### 当前平台
 
 ```bash
+# 直接构建（版本号显示为 dev）
 go build -o dist/logviewer .
+
+# 带版本号构建（VERSION 去掉前后空白/换行）
+go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 ```
 
 ### 交叉编译
 
 ```bash
+VER=$(cat VERSION | tr -d '\r\n')
 # Linux amd64
-GOOS=linux  GOARCH=amd64 go build -o dist/logviewer .
+GOOS=linux  GOARCH=amd64 go build -ldflags "-s -w -X main.version=$VER" -o dist/logviewer .
 # Linux arm64
-GOOS=linux  GOARCH=arm64 go build -o dist/logviewer .
+GOOS=linux  GOARCH=arm64 go build -ldflags "-s -w -X main.version=$VER" -o dist/logviewer .
 # macOS
-GOOS=darwin GOARCH=arm64 go build -o dist/logviewer .
+GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w -X main.version=$VER" -o dist/logviewer .
 # Windows
-GOOS=windows GOARCH=amd64 go build -o dist/logviewer.exe .
+GOOS=windows GOARCH=amd64 go build -ldflags "-s -w -X main.version=$VER" -o dist/logviewer.exe .
 ```
 
 ### 一键全平台打包
@@ -32,9 +43,9 @@ GOOS=windows GOARCH=amd64 go build -o dist/logviewer.exe .
 .\build_all_platforms.ps1
 ```
 
-会在 `dist/` 下生成 6 个压缩包（windows/linux/darwin × amd64/arm64）。
-
-> 注意：脚本里的 `$MainPath` 必须指向 `main.go` 所在目录（本项目为根目录 `.`）。
+脚本自动从 `VERSION` 读取版本号，在 `dist/` 下生成 6 个压缩包
+（windows/linux/darwin × amd64/arm64），包名形如
+`logviewer-v0.0.4-linux-amd64.tar.gz`。
 
 ## 2. 运行
 

@@ -66,6 +66,11 @@ func (m *Manager) Start(p Process, outFn func(string), errFn func(string), doneF
 		return 0, err
 	}
 	if err := p.Start(); err != nil {
+		// StdoutPipe 已为进程分配资源（本机是管道，远程 SSH 是已 NewSession 的
+		// channel，远端命令可能已经开始执行）。Start 失败时必须对称地 Kill 回收，
+		// 否则远程 session/channel 泄漏，只能等 GC 或连接关闭。Kill 对本机
+		// exec.Cmd（Process 尚为 nil）幂等无副作用。
+		_ = p.Kill()
 		return 0, err
 	}
 

@@ -62,6 +62,21 @@ func TestTimeBounds(t *testing.T) {
 			"2024-01-01 07:01:14", "2024-01-01 07:02:30", true},
 		{"default second", config.FilterRule{TimeStart: "2024-01-01 07:01:14", TimeEnd: "2024-01-01 07:02:30"},
 			"2024-01-01 07:01:14", "2024-01-01 07:02:30", true},
+		// 单边范围：只填起点/终点不应再让过滤失效
+		{"only start day", config.FilterRule{TimeStart: "2024-01-01", TimePrecision: "day"},
+			"2024-01-01 00:00:00", "", true},
+		{"only end day", config.FilterRule{TimeEnd: "2024-01-01", TimePrecision: "day"},
+			"", "2024-01-01 23:59:59", true},
+		{"only start minute", config.FilterRule{TimeStart: "2024-01-01 07:01", TimePrecision: "minute"},
+			"2024-01-01 07:01:00", "", true},
+		{"only end second", config.FilterRule{TimeEnd: "2024-01-01 07:02:30"},
+			"", "2024-01-01 07:02:30", true},
+		// 非法区间（终点早于起点）不启用
+		{"reversed", config.FilterRule{TimeStart: "2024-01-02", TimeEnd: "2024-01-01", TimePrecision: "day"},
+			"", "", false},
+		// 一端非法
+		{"bad start", config.FilterRule{TimeStart: "not-a-date", TimeEnd: "2024-01-01", TimePrecision: "day"},
+			"", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

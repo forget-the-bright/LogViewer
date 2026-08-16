@@ -245,8 +245,65 @@ func (h *SSHHost) runOneShot(cmdline string) error {
 	return nil
 }
 
+// RunOneShot 在远端执行一条短命命令至结束，返回合并输出与退出码。
+// 用于正则语法校验等一次性空跑检查。命令自身的非零退出通过 exitCode 返回，
+// 不视为 Go error；仅会话/连接级错误才返回 err。
+func (h *SSHHost) RunOneShot(cmd cmdbuild.Command) (string, int, error) {
+	if err := h.ensureConnected(); err != nil {
+		return "", -1, err
+	}
+	h.mu.Lock()
+	client := h.client
+	h.mu.Unlock()
+	if client == nil {
+		return "", -1, errors.New("SSH 未连接")
+	}
+	sess, err := client.NewSession()
+	if err != nil && isConnErr(err) {
+		// 连接错误：仅当旧连接仍是当前连接时才拆除（避免误杀并发重连建好的新连接），
+		// 然后重连一次重试。
+		h.invalidateConn(client)
+		if err2 := h.ensureConnected(); err2 != nil {
+			return "", -1, err2
+		}
+		h.mu.Lock()
+		client = h.client
+		h.mu.Unlock()
+		if client == nil {
+			return "", -1, errors.New("SSH 未连接")
+		}
+		sess, err = client.NewSession()
+	}
+	if err != nil {
+		return "", -1, err
+	}
+	defer sess.Close()
+
+	// 一次性短命令不需要 PID 标记/进程树管控，直接按 shell 执行即可，
+	// 避免 LV_PID 标记行污染校验输出。
+	cmdline := oneShotCmdLine(cmd)
+	out, runErr := sess.CombinedOutput(cmdline)
+	if runErr == nil {
+		return string(out), 0, nil
+	}
+	var exitErr *ssh.ExitError
+	if errors.As(runErr, &exitErr) {
+		return string(out), exitErr.ExitStatus(), nil
+	}
+	return string(out), -1, runErr
+}
+
+// oneShotCmdLine 把 cmdbuild.Command 翻译成一次性执行的命令行（不注入 PID 标记）。
+func oneShotCmdLine(cmd cmdbuild.Command) string {
+	if cmd.Shell == "powershell" {
+		return "powershell -NoProfile -NonInteractive -EncodedCommand " + encodePS(cmd.Script)
+	}
+	return "sh -c " + shSingleQuote(cmd.Script)
+}
+
 // newSession 从当前 client 创建一个新 session（供 StdoutPipe 使用）。
-// 如果连接已断开，尝试重连后再创建。
+// 如果连接已断开，尝试重连后再创建。重连用 invalidateConn(old) 做比较拆除，
+// 避免并发在途操作误杀彼此已重建的连接。
 func (h *SSHHost) newSession() (*ssh.Session, error) {
 	h.mu.Lock()
 	client := h.client
@@ -265,8 +322,8 @@ func (h *SSHHost) newSession() (*ssh.Session, error) {
 	}
 	sess, err := client.NewSession()
 	if err != nil && isConnErr(err) {
-		// 会话创建失败且为连接错误，断开重连后重试一次
-		h.closeConn()
+		// 会话创建失败且为连接错误：仅当旧连接仍是当前连接时拆除，再重连重试一次。
+		h.invalidateConn(client)
 		if err2 := h.ensureConnected(); err2 != nil {
 			return nil, err2
 		}

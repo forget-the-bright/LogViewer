@@ -56,6 +56,49 @@ func BuildExport(platform, filePath, encoding string, limit int, f FilterCfg) Co
 	return BuildView(platform, "static", filePath, encoding, limit, f)
 }
 
+// BuildRegexCheck 构造一条"只做正则语法校验、不读取任何文件"的命令。
+//
+// 设计原因：正则最终由目标机器的原生引擎执行（Unix: grep -E 的 POSIX ERE；
+// Windows: .NET 正则），与 Go 的 RE2 语法不同（RE2 支持 (?:...)、\d、\s 等，
+// POSIX ERE 不支持；反过来 .NET 又支持回溯/反向引用）。用 Go 的 regexp 编译
+// 会既误判合法、又漏判非法。根治做法是把用户的正则交给【真正会执行它的引擎】
+// 做空跑语法检查：喂空输入，让引擎在处理数据前先编译模式，语法错误会立即以
+// 非零退出 + stderr 报出，合法则静默成功。
+//
+// fixedExclude 为 true 时排除串按字面量（grep -F / SimpleMatch）校验，
+// 因为非正则模式下排除串不是正则。
+//
+// 这些命令不打开任何日志文件，执行代价是一次进程/会话创建，耗时可忽略。
+func BuildRegexCheck(platform, pattern string, caseSensitive bool) Command {
+	if platform == "windows" {
+		// .NET: 构造 Regex 对象即编译模式；喂空输入管道避免 Select-String 等待 stdin。
+		// 用 try/catch 把 [ArgumentException] 转成干净的中文错误并以非零退出。
+		opts := "None"
+		if !caseSensitive {
+			opts = "IgnoreCase"
+		}
+		// 强制 UTF-8 输出，否则本机中文 Windows 下异常消息会是 GBK 字节，前端乱码。
+		script := "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " +
+			"$OutputEncoding=[System.Text.Encoding]::UTF8; " +
+			"try { [void][regex]::new(" + psQuote(pattern) + ",[Text.RegularExpressions.RegexOptions]::" + opts + "); exit 0 } " +
+			"catch [ArgumentException] { [Console]::Error.WriteLine('正则语法错误: ' + $_.Exception.Message); exit 2 }"
+		return Command{Platform: platform, Shell: "powershell", Script: script}
+	}
+	// Unix: grep -E 在读取输入前就会编译 pattern。以 /dev/null 作空输入。
+	// 关键：grep 退出码语义是 0=匹配、1=无匹配、2=语法/IO 错误。对空输入而言，
+	// 【合法】正则必然返回 1（无匹配），若直接用退出码判断会把所有合法正则误判为非法。
+	// 因此用 `test $? -lt 2` 归一化：0/1（合法）→ 退出 0；2（错误）→ 退出非 0。
+	// stderr 仍原样透出，供上层提取引擎错误信息。
+	var o []string
+	o = append(o, "-E")
+	if !caseSensitive {
+		o = append(o, "-i")
+	}
+	inner := "grep " + strings.Join(o, " ") + " " + shQuote(pattern) + " /dev/null"
+	script := inner + "; test $? -lt 2"
+	return Command{Platform: platform, Shell: "sh", Script: script}
+}
+
 // ---- Unix (Linux/macOS) ----
 
 func unixView(mode, filePath, encoding string, limit int, f FilterCfg) string {
@@ -84,7 +127,8 @@ func unixView(mode, filePath, encoding string, limit int, f FilterCfg) string {
 		cmd += " | iconv -f GBK -t UTF-8"
 	}
 	// 时间范围：awk 字符串比较（有状态：保留落在范围内时间戳行之后的无时间戳续行，如堆栈）
-	if f.TimeStart != "" && f.TimeEnd != "" {
+	// 支持单边范围：任一端非空即启用过滤，空端表示无界。
+	if f.TimeStart != "" || f.TimeEnd != "" {
 		cmd += " | " + unixTimeStage(f.TimeStart, f.TimeEnd, mode == "follow")
 	}
 	cmd += unixFilter(f, mode == "follow")
@@ -93,15 +137,32 @@ func unixView(mode, filePath, encoding string, limit int, f FilterCfg) string {
 
 // unixTimeStage 用 awk 做时间范围过滤。
 // 匹配到时间戳的行按字典序比较；未带时间戳的行（堆栈续行）沿用上一行的判定。
+// start/end 任一可为空，表示该侧无界（开区间）。
 func unixTimeStage(start, end string, lineBuffered bool) string {
-	// 用 -v 传参，避免注入；fflush 保证 follow 模式实时输出。
+	// 动态拼比较条件：空端不参与比较。用 -v 传参，避免注入；fflush 保证 follow 实时输出。
 	// 注意：正则必须用 awk 兼容写法（awkTimeTokenPattern），mawk 不支持 {n} 区间量词。
-	prog := `{ if (match($0, /` + awkTimeTokenPattern + `/)) { t=substr($0,RSTART,RLENGTH); keep=(t>=s && t<=e) } if (keep) print`
+	var cond string
+	switch {
+	case start != "" && end != "":
+		cond = `t>=s && t<=e`
+	case start != "":
+		cond = `t>=s`
+	default:
+		cond = `t<=e`
+	}
+	prog := `{ if (match($0, /` + awkTimeTokenPattern + `/)) { t=substr($0,RSTART,RLENGTH); keep=(` + cond + `) } if (keep) print`
 	if lineBuffered {
 		prog += `; fflush()`
 	}
 	prog += ` }`
-	return "awk -v s=" + shQuote(start) + " -v e=" + shQuote(end) + " " + shQuote(prog)
+	args := "awk "
+	if start != "" {
+		args += "-v s=" + shQuote(start) + " "
+	}
+	if end != "" {
+		args += "-v e=" + shQuote(end) + " "
+	}
+	return args + shQuote(prog)
 }
 
 // unixFilter 追加 grep 过滤阶段。
@@ -186,7 +247,7 @@ func windowsView(mode, filePath, encoding string, limit int, f FilterCfg) string
 			sb.WriteString("[IO.File]::ReadLines(" + psQuote(filePath) + ",[Text.Encoding]::" + enc + ")")
 		}
 	}
-	if f.TimeStart != "" && f.TimeEnd != "" {
+	if f.TimeStart != "" || f.TimeEnd != "" {
 		sb.WriteString(windowsTimeStage(f.TimeStart, f.TimeEnd))
 	}
 	sb.WriteString(windowsFilter(f))
@@ -195,8 +256,18 @@ func windowsView(mode, filePath, encoding string, limit int, f FilterCfg) string
 
 // windowsTimeStage 用 Where-Object 做时间范围字符串比较。
 // $script:_keep 跨管道对象保持状态，使无时间戳的堆栈续行跟随上一条时间戳行的判定。
+// start/end 任一可为空，表示该侧无界。
 func windowsTimeStage(start, end string) string {
-	return " | Where-Object { if ($_ -match '" + timeTokenPattern + "') { $t=$Matches[0]; $script:_keep=($t -ge " + psQuote(start) + " -and $t -le " + psQuote(end) + ") }; $script:_keep }"
+	var cmp string
+	switch {
+	case start != "" && end != "":
+		cmp = "$t -ge " + psQuote(start) + " -and $t -le " + psQuote(end)
+	case start != "":
+		cmp = "$t -ge " + psQuote(start)
+	default:
+		cmp = "$t -le " + psQuote(end)
+	}
+	return " | Where-Object { if ($_ -match '" + timeTokenPattern + "') { $t=$Matches[0]; $script:_keep=(" + cmp + ") }; $script:_keep }"
 }
 
 // windowsFilter 追加 Select-String 过滤阶段。

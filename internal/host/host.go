@@ -24,7 +24,6 @@ type Node struct {
 	IsDir   bool   `json:"isDir"`
 	Size    int64  `json:"size"`
 	ModTime string `json:"modTime"`
-	HasLog  bool   `json:"hasLog"`
 }
 
 // Info 描述一台机器的概要信息，供顶栏切换器使用。
@@ -49,15 +48,26 @@ type Host interface {
 	Capabilities() Capabilities
 
 	// ResolvePath 校验 p 在允许的根目录内（含符号链接逃逸检测），
-	// 返回可用于后续 Stat/Open/Run 的规范化路径。
+	// 返回可用于后续 Stat/Open/Run 的规范化路径。每次用户输入只应调用一次：
+	// 后续 Stat/Open 直接复用返回的 abs，不再重复解析（SSH 下重复会产生
+	// 额外的 SFTP RealPath 往返）。
 	ResolvePath(p string) (string, error)
 
+	// Ls 列出目录内容。dir 为【原始】路径，内部自行 ResolvePath。
 	Ls(dir string) ([]Node, error)
+	// Stat/Open 的 path 必须是 ResolvePath 已返回的【规范化】路径，
+	// 它们不再重复做边界校验与符号链接解析。
 	Stat(path string) (os.FileInfo, error)
 	Open(path string) (io.ReadCloser, error)
 
 	// Run 在目标机器上执行命令管道，返回可被 procmgr 管控的进程。
 	Run(cmd cmdbuild.Command) (procmgr.Process, error)
+
+	// RunOneShot 在目标机器上执行一条短命命令至结束，返回合并输出与退出码。
+	// 与 Run 不同：它不走 procmgr（不托管为长生命周期进程），专为正则语法校验等
+	// "一次性空跑检查"设计。err 仅在命令无法启动/等待等基础设施错误时非空；
+	// 进程自身的非零退出码通过 exitCode 返回（不视为 Go error）。
+	RunOneShot(cmd cmdbuild.Command) (out string, exitCode int, err error)
 }
 
 // Manager 按别名管理所有 Host。并发安全，支持运行时 Rebuild。
@@ -116,7 +126,10 @@ func (m *Manager) Names() []string {
 // 新增的主机加入；移除的主机会被 Close（若是 SSHHost）；
 // 已存在且"身份相同"的主机保持不变（不中断正在读取的日志）。
 // identityKey 用于判断两台主机是否"同一个"：名称 + 连接配置指纹。
-func (m *Manager) Rebuild(newHosts []Host) {
+//
+// 返回被替换或被移除（即旧实例被 Close）的主机别名列表，供上层通知这些主机上
+// 的活跃连接重连到新实例。
+func (m *Manager) Rebuild(newHosts []Host) []string {
 	m.mu.Lock()
 	oldHosts := m.hosts
 	oldOrder := m.order
@@ -139,19 +152,18 @@ func (m *Manager) Rebuild(newHosts []Host) {
 	m.mu.Unlock()
 
 	// 关闭被移除或被替换的旧主机（在锁外执行，避免 Close 时反向抢锁）
-	oldSet := make(map[string]bool, len(oldOrder))
-	for _, name := range oldOrder {
-		oldSet[name] = true
-	}
+	var changed []string
 	for _, name := range oldOrder {
 		old := oldHosts[name]
 		if kept, ok := merged[name]; !ok || kept != old {
-			// 不在新集合中，或虽同名但被替换：关闭旧主机
+			// 不在新集合中，或虽同名但被替换：关闭旧实例并记录。
 			if c, ok := old.(interface{ Close() error }); ok {
 				_ = c.Close()
 			}
+			changed = append(changed, name)
 		}
 	}
+	return changed
 }
 
 // hostIdentityEqual 判断两台 Host 是否为"同一台且配置未变"。

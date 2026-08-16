@@ -36,6 +36,34 @@ type LogConfig struct {
 	HighlightRules []string   `json:"HighlightRules"`
 }
 
+// 参数上限：防止前端/被篡改的请求构造出病态命令（如 tail -n 1000000000
+// 一次性把整个大文件读爆内存，或负数 -n 导致命令行语法错误）。
+const (
+	// MaxReadLines 单次读取行数上限。0 表示不限（读全量），正数不得超过此值。
+	MaxReadLines = 1_000_000
+	// MaxContext grep 上下文行数上限（-B/-A），过大无意义且拖慢输出。
+	MaxContext = 10_000
+)
+
+// Validate 校验一次日志查看的数值参数是否在安全范围内。
+// 这些字段最终会被拼进原生命令（tail -n / grep -B -A / Get-Content -Tail），
+// 必须在构造命令前拦截越界值，而不是让病态命令行在远端执行失败。
+func (c LogConfig) Validate() error {
+	if c.ReadLinesLimit < 0 {
+		return fmt.Errorf("读取行数不能为负数: %d", c.ReadLinesLimit)
+	}
+	if c.ReadLinesLimit > MaxReadLines {
+		return fmt.Errorf("读取行数过大: %d（上限 %d）", c.ReadLinesLimit, MaxReadLines)
+	}
+	if c.ContextBefore < 0 || c.ContextAfter < 0 {
+		return fmt.Errorf("上下文行数不能为负数（前 %d 后 %d）", c.ContextBefore, c.ContextAfter)
+	}
+	if c.ContextBefore > MaxContext || c.ContextAfter > MaxContext {
+		return fmt.Errorf("上下文行数过大: 前 %d 后 %d（上限 %d）", c.ContextBefore, c.ContextAfter, MaxContext)
+	}
+	return nil
+}
+
 // DefaultConfigName 内置默认配置名
 const DefaultConfigName = "默认配置"
 

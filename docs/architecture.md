@@ -43,9 +43,10 @@ server 层不直接调用 `os.*` / `exec.*` / `runtime.GOOS`，而是通过 `Hos
 - `Run(cmdbuild.Command)` —— 返回 `procmgr.Process`，由 procmgr 统一管控
 
 `LocalHost` 是本机实现。`SSHHost` 通过 SSH+SFTP 访问远程机器：密码认证、known_hosts
-TOFU（首次落盘，之后严格校验）、`uname -s`/`cmd /c ver` 自动探测平台、keepalive 保活与
-断线重连。远程路径校验不依赖本机 `filepath`，而是按目标平台分隔符做词法清洗 + SFTP
-`RealPath` 解析符号链接，防止跨平台路径穿越与软链逃逸。
+TOFU（默认写入 `~/.ssh/known_hosts`，首次落盘后严格校验）、`uname -s`/`ver` 自动探测平台
+（Win32-OpenSSH 默认 shell 为 cmd.exe，用裸 `ver` 而非 `cmd /c ver`，避免嵌套引号 bug，
+另以 PowerShell 兜底）、keepalive 保活与断线重连。远程路径校验不依赖本机 `filepath`，
+而是按目标平台分隔符做词法清洗 + SFTP `RealPath` 解析符号链接，防止跨平台路径穿越与软链逃逸。
 
 远程命令执行由 `sshProc` 实现（`internal/host/ssh_proc.go`）：把 cmdbuild 生成的脚本
 包成 `sh -c '<script>'`（Unix）或 `powershell -NoProfile -NonInteractive -EncodedCommand
@@ -122,7 +123,8 @@ tail/grep 残留。
 - 配置 CRUD：`/api/h/:host/config/list|get|save|delete|rename|setdefault|preview`，每台机器独立预设。
 - 导出：`GET /api/h/:host/file/download/origin`（原始字节，带 `Content-Length`）、
   `POST /api/h/:host/file/download/filter`（按当前表单过滤，流式输出）。
-- WebSocket：`/ws?host=<alias>`，上行 `start`/`stop`/`ping`，下行 `log`/`error`/`status`。
+- WebSocket：`/ws?host=<alias>`，上行 `start`/`stop`/`ping`，下行 `log`/`error`/`status`
+  （`running`/`stopped`/`waiting`/`alive`）/`reconnect`（主机热更后通知前端迁移连接）。
 
 ## 请求流（一次实时跟踪）
 
@@ -149,7 +151,8 @@ tail/grep 残留。
 - 终端用本地 vendor 的 **xterm.js**（+ fit addon），所有前端依赖都在 `static/vendor/`，
   运行时不联网。
 - 行号用「双 xterm」方案：左侧一个只读、不可聚焦的 gutter 终端，按主终端的
-  `buffer.active.viewportY` 做绝对滚动同步。
+  `buffer.active.baseY + length` 绝对坐标计算新增行（scrollback 封顶后仍正确），
+  滚动位置跟随 `buffer.active.viewportY` 同步。
 - 时间选择器用 **flatpickr**（中文 locale），按天/时/分/秒四种粒度切换日期格式。
 - 主题用 CSS 变量 + `data-theme`，明/暗两套，xterm 的 theme 选项同步切换。
 
@@ -199,7 +202,9 @@ tail/grep 残留。
 
 `reloadCfg` 在锁内重新读取配置文件、解密密码、调用 `host.Manager.Rebuild` 原子替换主机集合。
 `Rebuild` 通过连接指纹（name + host:port + username + password 等关键 SSH 参数）判断主机是否
-变更——指纹相同的实例直接保留，正在跟踪的日志不会中断；新增/删除/配置变更的主机才创建或关闭。
+变更——指纹相同的实例直接保留，正在跟踪的日志不会中断；新增/删除/配置变更的主机才创建或关闭，
+`Rebuild` 返回被替换/移除的主机别名，`srv.NotifyHostsChanged` 给这些主机上的 WS 连接下发
+`{"type":"reconnect"}` 并关闭连接，前端 onclose 立即重连拿到新 Host 实例（抑制离线横幅）。
 LocalHost 始终保留（仅通过 `UpdateDirs` 更新根目录）。Reload 后通过 `srv.UpdateAuth` 热更新
 认证配置（开关/用户名变化时清空所有会话）。
 

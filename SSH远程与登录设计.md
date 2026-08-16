@@ -1,8 +1,8 @@
 # SSH 远程机器 / 登录认证 / 可拖拽侧栏 — 需求设计文档
 
 > 状态：**已全部实现（阶段一~四）**，本文保留为设计记录。实现与设计的主要偏差见文末「实现偏差」。
-> 适用版本：v0.1.0
-> last changed：2026-08-14
+> 适用版本：v0.0.4
+> last changed：2026-08-16
 
 本文档描述在现有「Go 只是外壳、一切操作都是原生命令」架构上，新增 SSH 远程日志查看、
 内置登录认证、机器切换、可拖拽侧栏四块能力的完整方案。包含配置格式、模块划分、接口契约、
@@ -645,3 +645,15 @@ GET  /ws?host=:host
 - **追踪空白行**：前端 `writeToTerminal` 原先对每个以 `\n` 结尾的批次额外补一个换行，
   导致 follow 新日志到达时多一个空行；已改为按 `\n` 切分、剥离 `\r` 后只在行间输出
   `\r\n`，不再追加尾随换行（local/win-local 实测数据一致）。
+- **Windows 平台探测命令**：设计稿用 `cmd /c ver`，实际改为裸 `ver`——Win32-OpenSSH
+  默认 shell 已是 cmd.exe，再嵌套 `cmd /c ver` 会触发 cmd 引号处理 bug（报
+  `'ver"' 不是内部或外部命令`，真实 Windows OpenSSH 上复现）；默认 shell 被改成
+  PowerShell 时再以 PowerShell 兜底。
+- **known_hosts 默认路径**：设计稿写"默认 `<exe>/known_hosts`"，实际为空时使用
+  `~/.ssh/known_hosts`（用户主目录），更符合 SSH 习惯。
+- **配置热加载**：设计稿（3.1）标注"不在本期范围"，后续已实现：前端"重载配置"按钮
+  或 Unix `SIGHUP` 触发热加载，未变更的 SSH 主机会话保留，并通过 WS `reconnect`
+  指令通知对应连接迁移到新 Host 实例。
+- **CLI 参数**：`-insecure-allow-remote` / `-verbose` 未实现（非本机绑定无认证时
+  只打印警告，不拒绝启动）；新增了 `-key` / `-encrypt-config` / `-decrypt-config`
+  用于 AES-256-GCM 配置密码加解密。

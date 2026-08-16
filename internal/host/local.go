@@ -1,9 +1,11 @@
 package host
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -15,29 +17,32 @@ import (
 	"logviewer/internal/procmgr"
 )
 
-// 允许展示的日志文件后缀。
-var allowedExts = map[string]bool{".log": true, ".out": true}
-
 // LocalHost 是本机实现：直接用 os.* 访问文件、用 exec 启动原生命令。
 type LocalHost struct {
 	name      string
 	platform  string
 	roots     []string // 已 Abs+Clean 的根目录
 	realRoots []string // roots 经 EvalSymlinks 后的真实路径（用于软链穿越校验）
+	exts      map[string]bool
+	showAll   bool // true 时展示所有文件（file_extensions 含 "*"）
 	cfgMgr    *config.Manager
 }
 
 // NewLocalHost 构造本机 Host。
 //   - dirs: 允许访问的根目录（会做 Abs+Clean+去重）；
+//   - exts: 目录树中展示的文件后缀（nil 表示默认 .log/.out；含 "*" 展示全部）；
 //   - initial: 初始过滤预设仓库；
 //   - saveCfg: 预设变更时的持久化回调（可为 nil，表示不持久化）。
-func NewLocalHost(name string, dirs []string, initial config.ConfigStore, saveCfg config.SaveFunc) (*LocalHost, error) {
+func NewLocalHost(name string, dirs []string, exts []string, initial config.ConfigStore, saveCfg config.SaveFunc) (*LocalHost, error) {
 	if name == "" {
 		name = "local"
 	}
+	extSet, showAll := normalizeExts(exts)
 	h := &LocalHost{
 		name:     name,
 		platform: runtime.GOOS,
+		exts:     extSet,
+		showAll:  showAll,
 		cfgMgr:   config.NewManager(initial, saveCfg),
 	}
 	for _, d := range dirs {
@@ -76,6 +81,23 @@ func (h *LocalHost) Name() string            { return h.name }
 func (h *LocalHost) Platform() string        { return h.platform }
 func (h *LocalHost) Configs() *config.Manager { return h.cfgMgr }
 
+// Fingerprint 返回本机实例的连接配置指纹，供 Manager.Rebuild 判断是否需要替换。
+// 本机的可变身份是根目录集合（dirs）：热加载改了 dirs 就必须让新实例生效，
+// 否则目录树永远停在旧集合上。name 已由 Manager 按别名匹配，这里只需编码 dirs。
+func (h *LocalHost) Fingerprint() string {
+	// 后缀集合计入指纹：改了 file_extensions 也要热加载生效（替换实例）。
+	var extList []string
+	if h.showAll {
+		extList = []string{"*"}
+	} else {
+		for e := range h.exts {
+			extList = append(extList, e)
+		}
+		sort.Strings(extList)
+	}
+	return "local|dirs=" + strings.Join(h.Dirs(), "|") + "|exts=" + strings.Join(extList, ",")
+}
+
 func (h *LocalHost) Info() Info {
 	return Info{
 		Name:      h.name,
@@ -90,21 +112,6 @@ func (h *LocalHost) Dirs() []string {
 	out := make([]string, len(h.roots))
 	copy(out, h.roots)
 	return out
-}
-
-// UpdateDirs 更新本机根目录列表（供热加载使用）。
-// 会重新做 Abs+Clean+去重和符号链接解析。
-func (h *LocalHost) UpdateDirs(dirs []string) {
-	h.roots = nil
-	h.realRoots = nil
-	for _, d := range dirs {
-		h.addRoot(d)
-	}
-	if len(h.roots) == 0 {
-		if cwd, err := os.Getwd(); err == nil {
-			h.addRoot(cwd)
-		}
-	}
 }
 
 // Capabilities 本机假定所有命令可用（Windows 用 PowerShell 原生命令，无需 tail/grep/awk/iconv）。
@@ -188,16 +195,13 @@ func (h *LocalHost) Ls(dir string) ([]Node, error) {
 		name := e.Name()
 		child := filepath.Join(abs, name)
 		isDir := e.IsDir()
-		if !isDir && !allowedExts[strings.ToLower(filepath.Ext(name))] {
+		if !isDir && !extAllow(name, h.exts, h.showAll) {
 			continue
 		}
 		n := Node{Name: name, Path: child, IsDir: isDir}
 		if f, err := e.Info(); err == nil {
 			n.Size = f.Size()
 			n.ModTime = f.ModTime().Format(time.RFC3339)
-		}
-		if isDir {
-			n.HasLog = dirContainsLog(child)
 		}
 		nodes = append(nodes, n)
 	}
@@ -210,22 +214,15 @@ func (h *LocalHost) Ls(dir string) ([]Node, error) {
 	return nodes, nil
 }
 
-// Stat 返回文件信息。
+// Stat 返回文件信息。path 必须是 ResolvePath 已返回的规范化绝对路径。
 func (h *LocalHost) Stat(path string) (os.FileInfo, error) {
-	abs, err := h.ResolvePath(path)
-	if err != nil {
-		return nil, err
-	}
-	return os.Stat(abs)
+	return os.Stat(path)
 }
 
 // Open 打开文件用于读取（原始下载）。调用方负责 Close。
+// path 必须是 ResolvePath 已返回的规范化绝对路径。
 func (h *LocalHost) Open(path string) (io.ReadCloser, error) {
-	abs, err := h.ResolvePath(path)
-	if err != nil {
-		return nil, err
-	}
-	return os.Open(abs)
+	return os.Open(path)
 }
 
 // Run 在本机启动命令。
@@ -233,21 +230,19 @@ func (h *LocalHost) Run(cmd cmdbuild.Command) (procmgr.Process, error) {
 	return procmgr.LocalProcess(cmd.BuildCmd()), nil
 }
 
-// dirContainsLog 判断目录（单层）是否含 log/out 文件或子目录（用于懒加载可展开标记）。
-func dirContainsLog(dir string) bool {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
+// RunOneShot 在本机执行一条短命命令至结束，返回合并输出与退出码。
+func (h *LocalHost) RunOneShot(cmd cmdbuild.Command) (string, int, error) {
+	c := cmd.BuildCmd()
+	out, err := c.CombinedOutput()
+	if err == nil {
+		return string(out), 0, nil
 	}
-	for _, e := range entries {
-		if e.IsDir() {
-			return true
-		}
-		if allowedExts[strings.ToLower(filepath.Ext(e.Name()))] {
-			return true
-		}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		// 命令自身非零退出：把退出码交给调用方判断（正则非法=2 等），不算基础设施错误。
+		return string(out), exitErr.ExitCode(), nil
 	}
-	return false
+	return string(out), -1, err
 }
 
 // PathError 路径安全相关错误。

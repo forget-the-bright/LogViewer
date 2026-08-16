@@ -16,9 +16,6 @@ build/
 *~
 
 # ========== 配置与运行时生成文件 ==========
-# 程序运行生成的用户配置、导出日志
-configs/*.json
-!configs/template.json       # 保留模板配置，注释掉这行不想保留模板就删掉
 # 含 SSH/登录密码，禁止提交
 logviewer.json
 configs.json.bak

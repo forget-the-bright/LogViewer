@@ -39,28 +39,14 @@ func defaultTemplate() string {
     "session_ttl_minutes": 720
   },
 
-  // 机器列表。键名即界面上显示的别名；"local" 是内置本机，无需 ssh 字段。
-  // 添加远程机器示例（取消注释并修改）：
-  //
-  // "prod-web-01": {
-  //   "ssh": {
-  //     "host": "10.0.0.11",
-  //     "port": 22,
-  //     "username": "root",
-  //     "password": "changeme",
-  //     "known_hosts_file": "",        // 留空用 ~/.ssh/known_hosts，首次自动 TOFU
-  //     "insecure_skip_host_key": false,
-  //     "connect_timeout_seconds": 10,
-  //     "keepalive_seconds": 30
-  //   },
-  //   "platform": "",                  // 留空自动探测（linux/darwin/windows）
-  //   "dirs": ["/var/log/nginx"],
-  //   "configs": { "default_name": "默认配置", "configs": {} }
-  // }
+
   "hosts": {
     "local": {
       // 本机扫描目录；命令行 -dir 传入的目录会追加到这里并去重。
       "dirs": [],
+      // 目录树展示的文件后缀（不区分大小写，可省略前导点）。
+      // 缺省为 [".log", ".out"]；设为 ["*"] 展示目录下所有文件。目录始终展示。
+      "file_extensions": [".log", ".out"],
       // 每台机器独立的过滤预设。
       "configs": {
         "default_name": "默认配置",
@@ -89,37 +75,64 @@ func defaultTemplate() string {
         }
       }
     }
+    // 机器列表。键名即界面上显示的别名；"local" 是内置本机，无需 ssh 字段。
+    // 添加远程机器示例（取消注释并修改）：
+    //
+    // "prod-web-01": {
+    //   "ssh": {
+    //     "host": "10.0.0.11",
+    //     "port": 22,
+    //     "username": "root",
+    //     "password": "changeme",
+    //     "known_hosts_file": "",        // 留空用 ~/.ssh/known_hosts，首次自动 TOFU
+    //     "insecure_skip_host_key": false,
+    //     "connect_timeout_seconds": 10,
+    //     "keepalive_seconds": 30
+    //   },
+    //   "platform": "",                  // 留空自动探测（linux/darwin/windows）
+    //   "dirs": ["/var/log/nginx"],
+    //   "file_extensions": [".log", ".out"],  // 目录树展示的文件后缀，缺省 .log/.out；["*"] 展示全部
+    //   "configs": { "default_name": "默认配置", "configs": {} }
+    // }
   }
 }
 `
 }
 
 // GenerateTemplate 在 path 写入带注释的默认配置。若 migrated 非 nil，
-// 把迁移来的 configs 填入 local 主机。
+// 把迁移来的 configs 原位填入 local 主机的 configs 子树，保留模板的注释、
+// 格式以及注释掉的远程主机示例。
 func GenerateTemplate(path string, migrated *config.ConfigStore) error {
-	content := defaultTemplate()
+	content := []byte(defaultTemplate())
 	if migrated != nil {
-		// 用迁移数据替换模板里的 local.configs
-		cfg := &AppConfig{}
-		// 解析模板（去注释）
-		val, err := parseJSONC([]byte(content))
+		// 仅替换 /hosts/local/configs 子树，不整体 Marshal（那会剥光注释）。
+		out, n, err := spliceRawValues(content, []splice{
+			{ptr: "/hosts/local/configs", newValue: *migrated},
+		})
 		if err != nil {
 			return err
 		}
-		if err := json.Unmarshal(val, cfg); err != nil {
-			return err
+		if n == 0 {
+			// 模板结构异常（理论上不会发生），回退到带迁移数据的标准 JSON。
+			b, err := json.MarshalIndent(AppConfig{
+				Addr: ":8080",
+				Auth: AuthConfig{SessionTTLMinutes: 720},
+				Hosts: map[string]HostConfig{
+					"local": {Configs: *migrated},
+				},
+			}, "", "  ")
+			if err != nil {
+				return err
+			}
+			content = append(b, '\n')
+		} else {
+			content = out
 		}
-		cfg.Hosts["local"] = HostConfig{Configs: *migrated}
-		b, err := json.MarshalIndent(cfg, "", "  ")
-		if err != nil {
-			return err
-		}
-		content = string(b) + "\n"
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o600)
+	return os.WriteFile(path, content, 0o600)
 }
 
 // tryMigrateOldConfig 查找旧版 <exe>/config/configs.json 并迁入。

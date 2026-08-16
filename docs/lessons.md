@@ -138,17 +138,16 @@ for {
 
 ---
 
-## "反转匹配"只在普通文本模式生效
+## "反转匹配"在普通与正则模式都生效
 
-前端正则/普通两种模式有联动：
+历史上前端在勾选"正则"时会隐藏并强制清空"反转"，理由是"反转仅普通模式有意义"。
+这个理由不成立：后端 `grepIncludeOpts` 对主模式恒用 `grep -E`，反转只是追加 `-v`
+（即 `grep -vE <pattern>`）；Windows 端 `Select-String -NotMatch -Pattern <regex>`
+同样支持对正则取反。因此对正则取反是合法且常见的需求。
 
-- 勾选"正则"：显示过滤规则构建器（级别/时间/自定义正则），隐藏"反转"复选框和
-  纯文本框；
-- 取消勾选：显示纯文本框和"反转"，隐藏构建器。
-
-后端对应：`AssemblePattern(rule, useRegex)` 在普通模式下**忽略自定义正则**，
-内容用 `regexp.QuoteMeta` 转成字面量；`InvertMatch` 仅在普通模式有意义，
-正则模式下提交时强制置 false。语义必须前后端一致，否则保存的配置重载后会失真。
+现已对齐：两种模式都显示并提交 `InvertMatch`。`AssemblePattern(rule, useRegex)`
+在普通模式下仍**忽略自定义正则**、内容用 `regexp.QuoteMeta` 转成字面量；
+但 `InvertMatch` 不再因模式而被清零。语义必须前后端一致，否则保存的配置重载后会失真。
 
 ---
 

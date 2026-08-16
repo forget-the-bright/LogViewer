@@ -17,17 +17,19 @@ go run .
 # 指定端口和扫描根目录
 go run . -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
-# 编译当前平台
-go build -o dist/logviewer .
+# 编译当前平台（版本号取自 VERSION，未注入时为 dev）
+go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 
-# 跑单元测试（主要是过滤规则拼装）
+# 跑单元测试
 go test ./...
 
 # 交叉编译
-GOOS=linux GOARCH=amd64 go build -o dist/logviewer .
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 ```
 
-Windows 下一键全平台打包：
+> 版本号唯一来源是根目录 `VERSION` 文件，**只能由开发者手动修改**，AI/自动化不得改动。
+
+Windows 下一键全平台打包（自动读取 `VERSION`）：
 
 ```powershell
 .\build_all_platforms.ps1
