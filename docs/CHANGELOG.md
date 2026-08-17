@@ -4,6 +4,42 @@
 构建时通过 `-ldflags "-X main.version=..."` 注入。格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [v0.0.5] - 2026-08-17
+
+### 新增
+- **断线缓冲补齐**：follow 会话与 WebSocket 连接解耦，断线宽限期（`session_grace_seconds`，
+  默认 45s）内进程持续运行、输出进入 2MB 有界环形缓冲；重连发 `attach` 按 `seq` 自动补发缺口，
+  缓冲溢出给出 `gap` 提示。静态模式仍连接绑定。
+- **可观测性**：`GET /healthz` 返回各主机连通状态；`GET /metrics` 暴露 Prometheus 指标
+  （活跃 WS 连接、日志进程数、SSH 重连次数、导出/下发字节数）；新增 `log_json` / `log_level`
+  配置输出结构化 JSON 日志（`internal/applog` 统一 slog 并重定向标准库 log）。
+- **界面体验**：主题跟随系统（自动/明/暗三态）、中/英国际化、紧凑/舒适密度、命令面板
+  （`Ctrl+Shift+P`）、完整快捷键体系与 `?` 帮助、滚动到顶/底悬浮按钮、移动端响应式
+  （汉堡菜单/全屏侧栏/底部配置抽屉）；偏好统一持久化。
+- **顶栏帮助/控制面板按钮**：右上角新增 `?`（快捷键帮助）与 `⌘`（命令面板）两个独立弹窗按钮。
+- **搜索结果计数**：Ctrl+F 终端搜索实时显示【当前 / 总数】（如 `3 / 127`），上下切换时同步更新；
+  超过装饰上限（5000）如实显示 `5000+`，无匹配显示"无匹配"。数据来自 search addon 官方
+  `onDidChangeResults` 事件，非自行计数。
+- **可配置 scrollback**：设置抽屉提供 5k/10k/20k/50k 档位（默认 10k）。
+- **轮转/截断提示**：`tail -F` 检测到日志轮转或截断时显示可关闭的非红色提示条，不再误报为错误；
+  "文件出现"等良性噪声静默。
+- 浏览器渲染压测页 `static/bench.html`（dev-only）与服务端管道压测 `BenchmarkReadLoopThroughput`
+  （20 万行约 25ms 排空，~8M 行/s）。
+
+### 修复
+- **P0 Ctrl+F 在日志区失效 / Ctrl+C 无法复制**：根因为 xterm 在捕获阶段对这些组合键
+  `preventDefault`。改用官方 `attachCustomKeyEventHandler` 对浏览器/UI 快捷键返回 `false`
+  （不阻止冒泡与默认行为），从根修复而非临时屏蔽事件。
+- **终端区 g/G/PgUp/PgDn 等快捷键失效**：根因有二——① `isTyping()` 把 xterm 聚焦时持有的只读
+  隐藏 textarea（`.xterm-helper-textarea`）误判为"正在输入"；② xterm 在捕获阶段对这些键
+  `stopPropagation+preventDefault`。修复：守卫排除该辅助 textarea，并在 custom key handler 中
+  对无修饰键的全局快捷键返回 `false` 放行，事件正常冒泡到全局处理器；方向键等仍交 xterm。
+- `TestValidate` 补齐新增 `LogLevel`/`SessionGraceSeconds` 校验所需字段，并新增非法值用例。
+
+### 变更
+- SSH `ssh.Client`/`sftp.Client` 单例复用经核实并加回归测试（连续 Ls/Stat/Open 只产生 1 个
+  TCP 连接）；重连经 `onReconnect` 回调计入 `logviewer_ssh_reconnects_total`。
+
 ## [v0.0.4] - 2026-08-16
 
 ### 新增

@@ -3,72 +3,80 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LogViewer 日志查看工具</title>
+<title data-i18n="appTitle">LogViewer 日志查看工具</title>
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/flatpickr.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">LogViewer</div>
+  <button id="hamburgerBtn" class="hamburger" data-i18n-title="menuTitle" title="菜单" aria-label="Menu">☰</button>
+  <div class="brand" data-i18n="brand">LogViewer</div>
   <div class="hosts">
-    <label>机器：</label>
-    <select id="hostSelect" title="选择要查看的机器"></select>
+    <label data-i18n="hostLabel">机器：</label>
+    <select id="hostSelect" data-i18n-title="hostSelectTitle" title="选择要查看的机器"></select>
   </div>
   <div class="roots">
-    <label>工作目录：</label>
-    <select id="rootSelect" title="选择根工作目录"></select>
-    <button id="refreshTreeBtn" title="刷新机器状态与目录树">刷新</button>
-    <button id="reloadCfgBtn" title="重新加载配置文件（热加载）">重载配置</button>
+    <label data-i18n="rootLabel">工作目录：</label>
+    <select id="rootSelect" data-i18n-title="rootSelectTitle" title="选择根工作目录"></select>
+    <button id="refreshTreeBtn" data-i18n="refresh" data-i18n-title="refreshTitle" title="刷新机器状态与目录树">刷新</button>
+    <button id="reloadCfgBtn" data-i18n="reloadConfig" data-i18n-title="reloadTitle" title="重新加载配置文件（热加载）">重载配置</button>
   </div>
   <div class="spacer"></div>
-  <button id="themeToggle" title="切换白天/黑夜主题">🌙 黑夜</button>
-  <button id="logoutBtn" class="logout-btn" title="退出登录" style="display:none">退出</button>
-  <div id="connStatus" class="status offline"><span class="dot"></span><span id="connText">未连接</span></div>
+  <select id="langSelect" class="lang-select" title="Language" aria-label="Language">
+    <option value="zh">中文</option>
+    <option value="en">EN</option>
+  </select>
+  <button id="themeToggle" data-i18n-title="themeTitle" title="切换主题">🌙 黑夜</button>
+  <button id="helpBtn" class="icon-btn" data-i18n-title="helpTitle" title="快捷帮助">?</button>
+  <button id="controlPanelBtn" class="icon-btn" data-i18n-title="controlPanelTitle" title="控制面板">⌘</button>
+  <button id="settingsBtn" class="icon-btn" data-i18n-title="settingsTitle" title="设置">⚙</button>
+  <button id="logoutBtn" class="logout-btn" data-i18n="logout" data-i18n-title="logoutTitle" title="退出登录" style="display:none">退出</button>
+  <div id="connStatus" class="status offline"><span class="dot"></span><span id="connText" data-i18n="connOffline">未连接</span></div>
 </header>
 
 <div id="main">
   <!-- 左侧：目录树 -->
   <aside id="treePanel">
     <div class="tree-header">
-      <span class="panel-title">日志文件</span>
-      <button id="sidebarCollapse" class="sidebar-toggle" title="收起侧栏">◀ 收起</button>
+      <span class="panel-title" data-i18n="filesTitle">日志文件</span>
+      <button id="sidebarCollapse" class="sidebar-toggle" data-i18n="collapseSidebar" data-i18n-title="collapseSidebar" title="收起侧栏">◀ 收起</button>
     </div>
     <div id="tree"></div>
   </aside>
   <!-- 拖拽分隔条：拖动调整左侧目录树宽度 -->
   <div id="splitter" class="splitter" title="拖动调整宽度"></div>
   <!-- 侧栏收起后的展开条 -->
-  <div id="sidebarReopen"><button title="展开侧栏">▶ 日志文件</button></div>
+  <div id="sidebarReopen"><button data-i18n="reopenSidebar" data-i18n-title="reopenTitle" title="展开侧栏">▶ 日志文件</button></div>
 
   <!-- 右侧：配置 + 终端 -->
   <main id="content">
     <section id="configPanel">
       <div class="cfg-quickbar">
-        <button id="cfgToggle" class="cfg-toggle" title="折叠/展开配置">▾ 收起配置</button>
-        <span class="brand-mini">过滤配置</span>
-        <select id="configSelect" title="已保存配置"></select>
-        <select id="followTail" title="查看模式">
-          <option value="true">实时跟踪 (tail -F)</option>
-          <option value="false">静态加载</option>
+        <button id="cfgToggle" class="cfg-toggle" data-i18n="cfgCollapse" data-i18n-title="cfgCollapseTitle" title="折叠/展开配置">▾ 收起配置</button>
+        <span class="brand-mini" data-i18n="configMini">过滤配置</span>
+        <select id="configSelect" data-i18n-title="savedConfigTitle" title="已保存配置"></select>
+        <select id="followTail" data-i18n-title="modeTitle" title="查看模式">
+          <option value="true" data-i18n="modeFollow">实时跟踪 (tail -F)</option>
+          <option value="false" data-i18n="modeStatic">静态加载</option>
         </select>
-        <input id="filePath" type="text" placeholder="已选日志文件路径（可手动填写，跟踪模式下文件可暂不存在）" spellcheck="false">
-        <button id="startBtn" class="btn-primary">开始跟踪</button>
-        <button id="stopBtn" class="btn-danger" disabled>停止跟踪</button>
+        <input id="filePath" type="text" data-i18n-placeholder="filePathPh" placeholder="已选日志文件路径（可手动填写，跟踪模式下文件可暂不存在）" spellcheck="false">
+        <button id="startBtn" class="btn-primary" data-i18n="startFollow">开始跟踪</button>
+        <button id="stopBtn" class="btn-danger" data-i18n="stopFollow" disabled>停止跟踪</button>
       </div>
       <div class="cfg-body" id="cfgBody">
         <div class="cfg-row cfg-header">
-          <input id="cfgName" type="text" placeholder="配置名称" class="cfg-name-input">
-          <button id="loadCfgBtn" title="加载选中配置">加载</button>
-          <button id="saveCfgBtn" title="保存当前配置">保存</button>
-          <button id="saveAsCfgBtn" title="另存为">另存</button>
-          <button id="renameCfgBtn" title="重命名配置">重命名</button>
-          <button id="delCfgBtn" title="删除配置">删除</button>
-          <button id="setDefaultCfgBtn" title="设为默认">设默认</button>
+          <input id="cfgName" type="text" data-i18n-placeholder="cfgNamePh" placeholder="配置名称" class="cfg-name-input">
+          <button id="loadCfgBtn" data-i18n="loadCfg" data-i18n-title="loadCfgTitle" title="加载选中配置">加载</button>
+          <button id="saveCfgBtn" data-i18n="saveCfg" data-i18n-title="saveCfgTitle" title="保存当前配置">保存</button>
+          <button id="saveAsCfgBtn" data-i18n="saveAsCfg" data-i18n-title="saveAsCfgTitle" title="另存为">另存</button>
+          <button id="renameCfgBtn" data-i18n="renameCfg" data-i18n-title="renameCfgTitle" title="重命名配置">重命名</button>
+          <button id="delCfgBtn" data-i18n="delCfg" data-i18n-title="delCfgTitle" title="删除配置">删除</button>
+          <button id="setDefaultCfgBtn" data-i18n="setDefaultCfg" data-i18n-title="setDefaultCfgTitle" title="设为默认">设默认</button>
         </div>
         <div class="cfg-grid">
           <div class="field">
-            <label>编码</label>
+            <label data-i18n="encoding">编码</label>
             <select id="encoding">
               <option value="utf-8">UTF-8</option>
               <option value="gbk">GBK</option>
@@ -76,54 +84,54 @@
             </select>
           </div>
           <div class="field">
-            <label>读取行数 <label class="inline-chk"><input id="limitEnable" type="checkbox" checked> 启用</label></label>
-            <input id="readLines" type="number" min="0" value="200" placeholder="不限">
+            <label><span data-i18n="readLines">读取行数</span> <label class="inline-chk"><input id="limitEnable" type="checkbox" checked> <span data-i18n="enable">启用</span></label></label>
+            <input id="readLines" type="number" min="0" value="200" data-i18n-placeholder="noLimit" placeholder="不限">
           </div>
           <div class="field">
-            <label>匹配前/后 N 行</label>
+            <label data-i18n="contextLines">匹配前/后 N 行</label>
             <div class="ctx-inputs">
-              <input id="contextBefore" type="number" min="0" value="0" title="前 N 行（grep -B）">
+              <input id="contextBefore" type="number" min="0" value="0" data-i18n-title="ctxBeforeTitle" title="前 N 行（grep -B）">
               <span>/</span>
-              <input id="contextAfter" type="number" min="0" value="0" title="后 N 行（grep -A）">
+              <input id="contextAfter" type="number" min="0" value="0" data-i18n-title="ctxAfterTitle" title="后 N 行（grep -A）">
             </div>
           </div>
           <div class="field switch-group">
-            <label class="switch"><input id="useRegex" type="checkbox"> 正则</label>
-            <label class="switch"><input id="caseSensitive" type="checkbox"> 大小写</label>
-            <label class="switch" id="invertWrap"><input id="invertMatch" type="checkbox"> 反转</label>
+            <label class="switch"><input id="useRegex" type="checkbox"> <span data-i18n="regex">正则</span></label>
+            <label class="switch"><input id="caseSensitive" type="checkbox"> <span data-i18n="caseSensitive">大小写</span></label>
+            <label class="switch" id="invertWrap"><input id="invertMatch" type="checkbox"> <span data-i18n="invert">反转</span></label>
           </div>
         </div>
 
         <!-- 普通文本过滤：仅在未勾选"正则"时显示 -->
         <div class="plain-filter">
-          <label>过滤文本</label>
-          <input id="plainContains" type="text" placeholder="输入要匹配的文本（按字面量匹配）">
+          <label data-i18n="plainFilter">过滤文本</label>
+          <input id="plainContains" type="text" data-i18n-placeholder="plainFilterPh" placeholder="输入要匹配的文本（按字面量匹配）">
         </div>
 
         <div class="builder">
           <div class="builder-head">
-            <span>过滤规则构建器</span>
-            <span class="builder-hint">条件可选，编译为一条正则；自定义正则优先</span>
+            <span data-i18n="builderTitle">过滤规则构建器</span>
+            <span class="builder-hint" data-i18n="builderHint">条件可选，编译为一条正则；自定义正则优先</span>
           </div>
           <div class="builder-grid">
             <div class="builder-row time-row">
-              <label>时间范围</label>
+              <label data-i18n="timeRange">时间范围</label>
               <select id="timePrecision" title="时间粒度">
-                <option value="day">按日</option>
-                <option value="hour">按时</option>
-                <option value="minute">按分</option>
-                <option value="second" selected>按秒</option>
+                <option value="day" data-i18n="timeDay">按日</option>
+                <option value="hour" data-i18n="timeHour">按时</option>
+                <option value="minute" data-i18n="timeMinute">按分</option>
+                <option value="second" selected data-i18n="timeSecond">按秒</option>
               </select>
               <!-- 时间范围：flatpickr 日期时间选择器，按粒度切换可选精度 -->
               <span class="time-inputs">
-                <input id="timeStart" type="text" class="fp-input" placeholder="开始时间" readonly>
+                <input id="timeStart" type="text" class="fp-input" data-i18n-placeholder="timeStartPh" placeholder="开始时间" readonly>
                 <span class="tilde">~</span>
-                <input id="timeEnd" type="text" class="fp-input" placeholder="结束时间" readonly>
+                <input id="timeEnd" type="text" class="fp-input" data-i18n-placeholder="timeEndPh" placeholder="结束时间" readonly>
               </span>
-              <button id="clearTimeBtn" class="mini-btn" type="button" title="清除时间范围">清除</button>
+              <button id="clearTimeBtn" class="mini-btn" type="button" data-i18n="clearTime" data-i18n-title="clearTimeTitle" title="清除时间范围">清除</button>
             </div>
             <div class="builder-row">
-              <label>日志级别</label>
+              <label data-i18n="levels">日志级别</label>
               <div class="level-chips" id="levelChips">
                 <label class="chip"><input type="checkbox" class="level-chk" value="ERROR"> ERROR</label>
                 <label class="chip"><input type="checkbox" class="level-chk" value="WARN"> WARN</label>
@@ -134,16 +142,16 @@
               </div>
             </div>
             <div class="builder-row two-col">
-              <div class="sub"><label>内容包含</label><input id="contains" type="text" placeholder="如 连接失败"></div>
-              <div class="sub"><label>内容排除</label><input id="exclude" type="text" placeholder="如 DEBUG"></div>
+              <div class="sub"><label data-i18n="contentInclude">内容包含</label><input id="contains" type="text" data-i18n-placeholder="includePh" placeholder="如 连接失败"></div>
+              <div class="sub"><label data-i18n="contentExclude">内容排除</label><input id="exclude" type="text" data-i18n-placeholder="excludePh" placeholder="如 DEBUG"></div>
             </div>
             <div class="builder-row">
-              <label>自定义正则</label>
-              <input id="customRegex" type="text" placeholder="直接写正则，覆盖上方拼装">
+              <label data-i18n="customRegex">自定义正则</label>
+              <input id="customRegex" type="text" data-i18n-placeholder="customRegexPh" placeholder="直接写正则，覆盖上方拼装">
             </div>
             <div class="builder-row preview">
-              <label>拼装预览</label>
-              <code id="regexPreview">(无过滤，读取全部)</code>
+              <label data-i18n="preview">拼装预览</label>
+              <code id="regexPreview" data-i18n="previewEmpty">(无过滤，读取全部)</code>
             </div>
             <div class="builder-row">
               <label></label>
@@ -153,41 +161,134 @@
         </div>
 
         <div class="cfg-row highlight-row">
-          <label>高亮关键词</label>
-          <input id="highlightRules" type="text" placeholder="ERROR, WARN, INFO（逗号分隔）">
+          <label data-i18n="highlight">高亮关键词</label>
+          <input id="highlightRules" type="text" data-i18n-placeholder="highlightPh" placeholder="ERROR, WARN, INFO（逗号分隔）">
         </div>
       </div>
     </section>
 
     <section id="termPanel">
       <div class="term-toolbar">
-        <span class="panel-title">日志输出</span>
+        <span class="panel-title" data-i18n="outputTitle">日志输出</span>
         <div class="spacer"></div>
-        <label class="line-num-toggle" title="在终端左侧显示行号"><input type="checkbox" id="lineNumToggle" checked> 行号</label>
-        <button id="pauseBtn" title="暂停/继续数据流">暂停</button>
-        <button id="clearBtn" title="清空终端">清空</button>
-        <button id="copyBtn" title="复制终端选中内容">复制</button>
-        <button id="exportRawBtn" title="导出原始日志文件">导出原始</button>
-        <button id="exportFilterBtn" title="按当前配置导出过滤日志">导出过滤</button>
+        <label class="line-num-toggle" data-i18n-title="lineNumTitle" title="在终端左侧显示行号"><input type="checkbox" id="lineNumToggle" checked> <span data-i18n="lineNum">行号</span></label>
+        <button id="pauseBtn" data-i18n="pause" data-i18n-title="pauseTitle" title="暂停/继续数据流">暂停</button>
+        <button id="clearBtn" data-i18n="clear" data-i18n-title="clearTitle" title="清空终端">清空</button>
+        <button id="copyBtn" data-i18n="copy" data-i18n-title="copyTitle" title="复制终端选中内容">复制</button>
+        <button id="exportRawBtn" data-i18n="exportRaw" data-i18n-title="exportRawTitle" title="导出原始日志文件">导出原始</button>
+        <button id="exportFilterBtn" data-i18n="exportFilter" data-i18n-title="exportFilterTitle" title="按当前配置导出过滤日志">导出过滤</button>
       </div>
       <div class="term-wrap">
         <div id="gutter"></div>
         <div id="terminal"></div>
+        <div id="scrollFab" class="scroll-fab" style="display:none">
+          <button id="fabTop" type="button" title="回到顶部" data-i18n-title="fabTopTitle">↑</button>
+          <button id="fabBottom" type="button" title="回到底部 / 继续跟踪" data-i18n-title="fabBottomTitle">↓</button>
+        </div>
+        <div id="noticeBar" class="notice-bar" style="display:none">
+          <span id="noticeText" class="notice-text"></span>
+          <button id="noticeClose" type="button" class="notice-close" title="关闭" data-i18n-title="scClose">×</button>
+        </div>
         <div id="searchBar" class="search-bar" style="display:none">
-          <input type="text" id="searchInput" placeholder="终端内查找 (Ctrl+F)" autocomplete="off" spellcheck="false">
-          <label class="search-case" title="区分大小写"><input type="checkbox" id="searchCase"> Aa</label>
-          <button id="searchPrev" title="上一个 (Shift+Enter)">▲</button>
-          <button id="searchNext" title="下一个 (Enter)">▼</button>
-          <button id="searchClose" title="关闭 (Esc)">×</button>
+          <input type="text" id="searchInput" data-i18n-placeholder="searchPh" placeholder="终端内查找 (Ctrl+F)" autocomplete="off" spellcheck="false">
+          <label class="search-case" data-i18n-title="searchCaseTitle" title="区分大小写"><input type="checkbox" id="searchCase"> Aa</label>
+          <button id="searchPrev" data-i18n-title="searchPrevTitle" title="上一个 (Shift+Enter)">▲</button>
+          <button id="searchNext" data-i18n-title="searchNextTitle" title="下一个 (Enter)">▼</button>
+          <button id="searchClose" data-i18n-title="searchCloseTitle" title="关闭 (Esc)">×</button>
           <span id="searchCount" class="search-count"></span>
         </div>
         <div id="disconnectBanner" class="disconnect-banner">
-          <span class="banner-text">连接已断开，正在尝试重连...</span>
-          <button id="reconnectBtn" class="banner-btn">立即重连</button>
+          <span class="banner-text" data-i18n="disconnectText">连接已断开，正在尝试重连...</span>
+          <button id="reconnectBtn" class="banner-btn" data-i18n="reconnectNow">立即重连</button>
         </div>
       </div>
     </section>
   </main>
+</div>
+
+<!-- 快捷键帮助 -->
+<div id="shortcutsHelp" class="overlay-mask">
+  <div class="overlay-card shortcuts-card">
+    <div class="overlay-head">
+      <span data-i18n="shortcutsTitle">键盘快捷键</span>
+      <button id="shortcutsClose" class="overlay-close" type="button" data-i18n-title="scClose" title="关闭">×</button>
+    </div>
+    <div class="overlay-body">
+      <table class="shortcuts-table">
+        <tr><td><kbd>/</kbd></td><td data-i18n="scSearch">聚焦终端搜索</td></tr>
+        <tr><td><kbd>t</kbd></td><td data-i18n="scToggleFollow">切换 实时跟踪/静态加载</td></tr>
+        <tr><td><kbd>s</kbd></td><td data-i18n="scStartStop">开始 / 停止</td></tr>
+        <tr><td><kbd>g</kbd></td><td data-i18n="scTop">滚动到顶部</td></tr>
+        <tr><td><kbd>G</kbd></td><td data-i18n="scBottom">滚动到底部</td></tr>
+        <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd></td><td data-i18n="scPageUp">向上/下翻页</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td data-i18n="scSearch">聚焦终端搜索</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd></td><td data-i18n="scPalette">打开命令面板</td></tr>
+        <tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td data-i18n="scTabs">标签页切换（预留）</td></tr>
+        <tr><td><kbd>?</kbd></td><td data-i18n="scHelp">显示此帮助</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td data-i18n="scClose">关闭</td></tr>
+      </table>
+      <p class="shortcuts-note" data-i18n="scNote">在输入框/文本域中按键时保持浏览器原生行为。</p>
+    </div>
+  </div>
+</div>
+
+<!-- 命令面板 -->
+<div id="commandPalette" class="overlay-mask">
+  <div class="overlay-card palette-card">
+    <input id="paletteInput" type="text" data-i18n-placeholder="palettePh" placeholder="输入命令名称进行模糊搜索…" autocomplete="off" spellcheck="false">
+    <ul id="paletteList" class="palette-list"></ul>
+  </div>
+</div>
+
+<!-- 设置抽屉 -->
+<div id="settingsDrawer" class="overlay-mask">
+  <div class="overlay-card settings-card">
+    <div class="overlay-head">
+      <span data-i18n="settingsTitle">设置</span>
+      <button id="settingsClose" class="overlay-close" type="button" data-i18n-title="scClose" title="关闭">×</button>
+    </div>
+    <div class="overlay-body settings-body">
+      <div class="setting-row">
+        <label data-i18n="settingTheme">主题</label>
+        <div class="seg" id="themeSeg">
+          <button type="button" data-theme="auto" data-i18n="settingThemeAuto">跟随系统</button>
+          <button type="button" data-theme="light" data-i18n="settingThemeLight">白天</button>
+          <button type="button" data-theme="dark" data-i18n="settingThemeDark">黑夜</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settingLang">语言</label>
+        <div class="seg" id="langSeg">
+          <button type="button" data-lang="zh">中文</button>
+          <button type="button" data-lang="en">English</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settingDensity">密度</label>
+        <div class="seg" id="densitySeg">
+          <button type="button" data-density="compact" data-i18n="settingDensityCompact">紧凑</button>
+          <button type="button" data-density="comfortable" data-i18n="settingDensityComfortable">舒适</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settingFontSize">字号 <span id="fontSizeVal" class="setting-val"></span></label>
+        <input id="fontSizeRange" type="range" min="12" max="18" step="1">
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settingLineHeight">行高 <span id="lineHeightVal" class="setting-val"></span></label>
+        <input id="lineHeightRange" type="range" min="1.0" max="1.6" step="0.05">
+      </div>
+      <div class="setting-row">
+        <label data-i18n="settingScrollback">回溯行数</label>
+        <select id="scrollbackSelect">
+          <option value="5000">5,000</option>
+          <option value="10000">10,000</option>
+          <option value="20000">20,000</option>
+          <option value="50000">50,000</option>
+        </select>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -195,29 +296,29 @@
 <!-- 登录遮罩（启用认证且未登录时显示） -->
 <div id="loginMask" class="login-mask">
   <form id="loginForm" class="login-card">
-    <div class="login-title">LogViewer 登录</div>
-    <label class="login-field">用户名
+    <div class="login-title" data-i18n="loginTitle">LogViewer 登录</div>
+    <label class="login-field"><span data-i18n="username">用户名</span>
       <input id="loginUser" type="text" autocomplete="username" required>
     </label>
-    <label class="login-field">密码
+    <label class="login-field"><span data-i18n="password">密码</span>
       <input id="loginPass" type="password" autocomplete="current-password" required>
     </label>
     <div id="loginError" class="login-error"></div>
-    <button type="submit" id="loginBtn" class="btn-primary">登录</button>
+    <button type="submit" id="loginBtn" class="btn-primary" data-i18n="loginBtn">登录</button>
   </form>
 </div>
 
 <!-- 导出进度遮罩 -->
 <div id="exportMask" class="export-mask">
   <div class="export-dialog">
-    <div class="export-title" id="exportTitle">正在导出...</div>
+    <div class="export-title" id="exportTitle" data-i18n="exportingRaw">正在导出...</div>
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="export-meta">
-      <span id="exportStatus">准备中...</span>
+      <span id="exportStatus" data-i18n="exportPreparing">准备中...</span>
       <span id="exportPercent">0%</span>
     </div>
     <div class="export-actions">
-      <button id="exportCancelBtn" type="button">取消导出</button>
+      <button id="exportCancelBtn" type="button" data-i18n="exportCancel">取消导出</button>
     </div>
   </div>
 </div>
@@ -227,6 +328,7 @@
 <script src="/static/vendor/search.js"></script>
 <script src="/static/vendor/flatpickr.js"></script>
 <script src="/static/vendor/flatpickr.zh.js"></script>
+<script src="/static/i18n.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

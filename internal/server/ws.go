@@ -1,11 +1,10 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
-	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"logviewer/internal/cmdbuild"
 	"logviewer/internal/config"
 	"logviewer/internal/host"
+	"logviewer/internal/metrics"
 )
 
 // wsClient 每个连接的状态：写锁 + 当前子进程 + 所属机器。
@@ -29,10 +29,12 @@ type wsClient struct {
 	host     host.Host
 	hostName string
 
-	runMu     sync.Mutex
-	procID    uint64
-	runGen    uint64
-	runCancel context.CancelFunc
+	runMu  sync.Mutex
+	procID uint64 // 仅静态模式（一次性读取）使用；follow 模式由 viewSession 管理
+
+	// session 是当前连接附着的 follow 会话（断线宽限/补齐）。
+	// 静态模式为 nil。
+	session *viewSession
 }
 
 // filePollInterval 等待暂不存在的日志文件时的轮询间隔。
@@ -40,9 +42,11 @@ const filePollInterval = 500 * time.Millisecond
 
 // wsMessage 上行指令
 type wsMessage struct {
-	Action   string           `json:"action"`
-	FilePath string           `json:"filePath"`
-	Config   config.LogConfig `json:"config"`
+	Action    string           `json:"action"`
+	FilePath  string           `json:"filePath"`
+	Config    config.LogConfig `json:"config"`
+	SessionID string           `json:"sessionID"`
+	LastSeq   uint64           `json:"lastSeq"`
 }
 
 const (
@@ -79,10 +83,14 @@ func (s *Server) handleWS(c *gin.Context) {
 	s.registerClient(cl, hostName)
 
 	defer func() {
-		s.stopSession(cl)
+		// WS 断开：follow 会话进入宽限期（不杀进程，缓冲日志等重连 attach）；
+		// 静态进程无补齐意义，直接回收。
+		s.detachClient(cl, false)
 		s.unregisterClient(cl)
 		conn.Close()
 	}()
+	metrics.WSInc(hostName)
+	defer metrics.WSDec(hostName)
 
 	conn.SetReadLimit(1 << 20)
 	conn.SetReadDeadline(time.Now().Add(wsPongWait))
@@ -122,6 +130,8 @@ func (s *Server) handleWS(c *gin.Context) {
 		switch msg.Action {
 		case "start":
 			s.startSession(cl, &msg)
+		case "attach":
+			s.attachSession(cl, &msg)
 		case "stop":
 			s.stopSession(cl)
 			s.sendStatus(cl, "stopped")
@@ -131,52 +141,72 @@ func (s *Server) handleWS(c *gin.Context) {
 	}
 }
 
-// startSession 启动一次日志查看：构建系统原生命令管道并托管其进程。
+// startSession 启动一次日志查看。
 //
-// 跟踪模式下文件允许暂不存在：此时不立即启动命令（旧实现会立即 tail 一个不存在的
-// 文件，瞬间把 "No such file" 抛给前端、状态在 waiting/running/error 间闪烁），
-// 而是先下发 waiting，在后台轮询直到文件出现（或被 stop/切换取消）再启动。
+// 跟踪（follow）模式走 viewSession：会话与连接解耦，断线进入宽限期并缓冲日志，
+// 重连可按序号补齐（详见 session.go）。静态模式仍是一次性读取，进程绑定到当前
+// 连接，断连即杀（无补齐意义）。
 func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
-	// 开新一代任务：取消上一代的等待/进程。
-	cl.runMu.Lock()
-	if cl.runCancel != nil {
-		cl.runCancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cl.runGen++
-	gen := cl.runGen
-	cl.runCancel = cancel
-	if cl.procID != 0 {
-		s.procs.Stop(cl.procID)
-		cl.procID = 0
-	}
-	cl.runMu.Unlock()
+	// 先停掉本连接上一代任务（静态进程 或 已附着会话）。
+	s.detachClient(cl, true)
 
-	// 在拼命令前拦截越界的数值参数（读取行数/上下文行数），避免构造出
-	// tail -n 1000000000 之类的病态命令行。
+	if msg.Config.FollowTail {
+		grace := s.sessionGrace
+		if grace <= 0 {
+			grace = 45 * time.Second
+		}
+		sess := &viewSession{
+			id:       newSessionID(),
+			hostName: cl.hostName,
+			msg:      msg,
+			follow:   true,
+			grace:    grace,
+			client:   cl,
+			reg:      s.sessions,
+		}
+		cl.session = sess
+		s.sessions.put(sess)
+		slog.Info("启动 follow 会话", "session", sess.id, "host", cl.hostName,
+			"file", baseName(msg.FilePath), "grace", grace.String())
+		sess.start()
+		return
+	}
+	s.startStatic(cl, msg)
+}
+
+// attachSession 重连后尝试接管一个仍存活的 follow 会话，按 lastSeq 补发缺口日志。
+// 若会话已失效（宽限到期/进程退出/被销毁），回退到全量 start。
+func (s *Server) attachSession(cl *wsClient, msg *wsMessage) {
+	s.detachClient(cl, true)
+	if msg.SessionID != "" {
+		if sess := s.sessions.get(msg.SessionID); sess != nil {
+			if sess.attach(cl, msg.LastSeq) {
+				cl.session = sess
+				return
+			}
+			// 会话已死：回退到全量启动（下方）。
+		}
+	}
+	// 无可接管会话：若带了 filePath/config 就全新启动，否则什么也不做。
+	if msg.FilePath != "" {
+		s.startSession(cl, msg)
+	}
+}
+
+// startStatic 启动一次性读取（非 follow），进程直接绑定到当前连接。
+func (s *Server) startStatic(cl *wsClient, msg *wsMessage) {
 	if err := msg.Config.Validate(); err != nil {
 		s.sendError(cl, "参数错误: "+err.Error())
 		return
 	}
-
 	h := cl.host
-
 	abs, err := h.ResolvePath(msg.FilePath)
 	if err != nil {
 		s.sendError(cl, err.Error())
 		return
 	}
-
-	// 同步做目录/存在性预检：
-	//   - 目录、明确的权限错误等：立即报错，不进入等待。
-	//   - follow 且文件不存在：进入后台等待。
 	info, statErr := h.Stat(abs)
 	if statErr != nil {
-		if os.IsNotExist(statErr) && msg.Config.FollowTail {
-			s.sendStatus(cl, "waiting")
-			go s.waitForFileAndRun(cl, gen, ctx, abs, msg)
-			return
-		}
 		s.sendError(cl, "无法访问文件: "+statErr.Error())
 		return
 	}
@@ -184,39 +214,43 @@ func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
 		s.sendError(cl, "所选为目录，请选择日志文件")
 		return
 	}
-
-	s.launchView(cl, gen, abs, msg)
-}
-
-// waitForFileAndRun 在后台轮询直到目标文件出现（或被取消），然后启动查看。
-// gen 用于在启动前确认自己仍是当前这一代任务。
-func (s *Server) waitForFileAndRun(cl *wsClient, gen uint64, ctx context.Context, abs string, msg *wsMessage) {
-	t := time.NewTicker(filePollInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		info, err := cl.host.Stat(abs)
-		if err == nil && info != nil && !info.IsDir() {
-			// 文件出现。若期间已被新一代任务取代，则放弃启动。
+	var procID uint64
+	procID, err = s.runView(h, abs, msg,
+		func(batch string) {
+			metrics.IncLogBytes(len(batch))
+			s.sendText(cl, `{"type":"log","data":`+jsonQuote(batch)+`}`)
+		},
+		func(errLine string) {
+			s.forwardStderr(cl, errLine)
+		},
+		func() {
 			cl.runMu.Lock()
-			current := cl.runGen == gen
-			cl.runMu.Unlock()
-			if current {
-				s.launchView(cl, gen, abs, msg)
+			isCurrent := cl.procID == procID
+			if isCurrent {
+				cl.procID = 0
 			}
-			return
-		}
+			cl.runMu.Unlock()
+			s.refreshProcMetric()
+			if isCurrent {
+				s.sendStatus(cl, "stopped")
+			}
+		})
+	if err != nil {
+		s.sendError(cl, viewErrMsg(err))
+		return
 	}
+	cl.runMu.Lock()
+	cl.procID = procID
+	cl.runMu.Unlock()
+	s.refreshProcMetric()
+	s.sendStatus(cl, "running")
 }
 
-// launchView 构建命令并启动进程。gen 用于过期回调保护：进程结束时只有仍是当前代
-// 才下发 stopped 状态，避免旧代的进程退出把新一代任务误报成已停止。
-func (s *Server) launchView(cl *wsClient, gen uint64, abs string, msg *wsMessage) {
-	h := cl.host
+// runView 构建日志查看命令并在给定主机上启动，把 stdout/stderr/退出路由到回调。
+// 返回托管后的进程 ID。命令完全由原生 tail/cat/grep/awk/iconv 或 PowerShell 承担，
+// Go 不重写其能力（架构原则：一切都是命令）。
+func (s *Server) runView(h host.Host, abs string, msg *wsMessage,
+	outFn func(string), errFn func(string), doneFn func()) (uint64, error) {
 	mode := "static"
 	if msg.Config.FollowTail {
 		mode = "follow"
@@ -234,74 +268,66 @@ func (s *Server) launchView(cl *wsClient, gen uint64, abs string, msg *wsMessage
 		ContextBefore: msg.Config.ContextBefore,
 		ContextAfter:  msg.Config.ContextAfter,
 	}
-	// 自定义正则仅在勾选"正则"时生效，并覆盖时间阶段
 	if msg.Config.UseRegex && rule.CustomRegex != "" {
 		f.TimeStart, f.TimeEnd = "", ""
 	}
 	if msgErr := checkCaps(h, msg.Config.Encoding, f.TimeStart != "" || f.TimeEnd != ""); msgErr != "" {
-		s.sendError(cl, msgErr)
-		return
+		return 0, errView(msgErr)
 	}
-	// 用目标机器的原生引擎预校验正则：非法时立即返回可读错误，
-	// 而不是启动管道后再从 stderr 冒出生硬的引擎报错。
 	if msgErr := validateFilter(h, f); msgErr != "" {
-		s.sendError(cl, msgErr)
-		return
+		return 0, errView(msgErr)
 	}
 	viewCmd := cmdbuild.BuildView(h.Platform(), mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f)
-	log.Printf("[ws] host=%s mode=%s file=%s shell=%s", h.Name(), mode, baseName(abs), viewCmd.Shell)
+	slog.Info("启动日志查看",
+		"host", h.Name(), "mode", mode, "file", baseName(abs),
+		"config", msg.Config.ConfigName, "shell", viewCmd.Shell)
 	proc, err := h.Run(viewCmd)
 	if err != nil {
-		s.sendError(cl, "启动命令失败: "+err.Error())
-		return
+		return 0, err
 	}
-
-	var procID uint64
-	procID, err = s.procs.Start(proc, func(batch string) {
-		s.sendText(cl, `{"type":"log","data":`+jsonQuote(batch)+`}`)
-	}, func(errLine string) {
-		if line := classifyStderr(errLine); line != "" {
-			s.sendError(cl, line)
-		}
-	}, func() {
-		// 进程自然退出：仅当它仍是当前代任务时才通知前端 stopped。
-		cl.runMu.Lock()
-		isCurrent := cl.procID == procID && cl.runGen == gen
-		if isCurrent {
-			cl.procID = 0
-		}
-		cl.runMu.Unlock()
-		if isCurrent {
-			s.sendStatus(cl, "stopped")
-		}
-	})
-	if err != nil {
-		s.sendError(cl, "启动命令失败: "+err.Error())
-		return
-	}
-	cl.runMu.Lock()
-	if cl.runGen != gen {
-		// 启动期间已被新一代取代：立即停掉这个进程，不更新状态。
-		cl.runMu.Unlock()
-		s.procs.Stop(procID)
-		return
-	}
-	cl.procID = procID
-	cl.runMu.Unlock()
-	s.sendStatus(cl, "running")
+	return s.procs.Start(proc, outFn, errFn, doneFn)
 }
 
-// stopSession 停止当前连接绑定的命令进程与等待中的文件轮询。
-func (s *Server) stopSession(cl *wsClient) {
-	cl.runMu.Lock()
-	if cl.runCancel != nil {
-		cl.runCancel()
+// errView 把 runView 的预检失败（缺命令/非法正则等）包装成普通 error。
+// 这类错误文案已是可直接展示的中文说明，前端应原样透传，不加"启动命令失败"前缀。
+type errView string
+
+func (e errView) Error() string { return string(e) }
+
+func viewErrMsg(err error) string {
+	if _, ok := err.(errView); ok {
+		return err.Error()
 	}
+	return "启动命令失败: " + err.Error()
+}
+
+// stopSession 停止当前连接绑定的命令：follow 会话立即销毁（不进宽限），静态进程被杀。
+func (s *Server) stopSession(cl *wsClient) {
+	s.detachClient(cl, true)
+	s.refreshProcMetric()
+}
+
+// detachClient 解绑连接与会话/进程。
+//   - 若附着的是 follow 会话：killSession=true 时立即销毁（用户 stop/切换/关闭），
+//     false 时仅分离连接、会话进入断线宽限（WS 断开时使用）。
+//   - 若有静态进程：总是杀掉。
+func (s *Server) detachClient(cl *wsClient, killSession bool) {
+	cl.runMu.Lock()
+	sess := cl.session
+	cl.session = nil
 	procID := cl.procID
 	cl.procID = 0
 	cl.runMu.Unlock()
+
 	if procID != 0 {
 		s.procs.Stop(procID)
+	}
+	if sess != nil {
+		if killSession {
+			sess.destroy()
+		} else {
+			sess.detach()
+		}
 	}
 }
 
@@ -325,6 +351,23 @@ func (s *Server) sendText(cl *wsClient, text string) {
 
 func (s *Server) sendError(cl *wsClient, msg string) {
 	s.sendText(cl, `{"type":"error","msg":`+jsonQuote(msg)+`}`)
+}
+
+// sendNotice 下发一条非错误通知（日志轮转/截断/断线缺口），由前端显示为可关闭提示条。
+func (s *Server) sendNotice(cl *wsClient, kind string) {
+	s.sendText(cl, `{"type":"notice","kind":`+jsonQuote(kind)+`}`)
+}
+
+// forwardStderr 把一行子进程 stderr 按分类转发为 error 或 notice。
+func (s *Server) forwardStderr(cl *wsClient, line string) {
+	switch classifyStderr(line) {
+	case stderrError:
+		s.sendError(cl, strings.TrimSpace(trimLine(line)))
+	case stderrRotate:
+		s.sendNotice(cl, "rotate")
+	case stderrTruncate:
+		s.sendNotice(cl, "truncate")
+	}
 }
 
 func (s *Server) sendStatus(cl *wsClient, status string) {

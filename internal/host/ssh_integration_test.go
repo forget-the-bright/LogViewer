@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,8 @@ import (
 
 // startTestSSHServer 起一个本机回环的 SSH+SFTP 服务，用于集成测试。
 // exec "uname -s" 返回 Linux；subsystem sftp 由 pkg/sftp 的默认文件后端提供（直接服务本机文件系统）。
-func startTestSSHServer(t *testing.T) (addr string, cleanup func()) {
+// accepted 返回服务器累计接受的 TCP 连接数，用于断言连接复用。
+func startTestSSHServer(t *testing.T) (addr string, accepted func() int64, cleanup func()) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -43,6 +45,7 @@ func startTestSSHServer(t *testing.T) (addr string, cleanup func()) {
 	}
 	cfg.AddHostKey(signer)
 
+	var acceptedCount int64
 	done := make(chan struct{})
 	go func() {
 		for {
@@ -50,11 +53,12 @@ func startTestSSHServer(t *testing.T) (addr string, cleanup func()) {
 			if err != nil {
 				return
 			}
+			atomic.AddInt64(&acceptedCount, 1)
 			go handleTestConn(conn, cfg, done)
 		}
 	}()
 
-	return ln.Addr().String(), func() {
+	return ln.Addr().String(), func() int64 { return atomic.LoadInt64(&acceptedCount) }, func() {
 		ln.Close()
 		select {
 		case <-done:
@@ -163,7 +167,7 @@ func TestSSHIntegration_LsStatOpen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip in-process sftp server test on windows; validate against real remote host")
 	}
-	addr, cleanup := startTestSSHServer(t)
+	addr, accepted, cleanup := startTestSSHServer(t)
 	defer cleanup()
 
 	tmp := t.TempDir()
@@ -183,6 +187,10 @@ func TestSSHIntegration_LsStatOpen(t *testing.T) {
 
 	h := newTestSSHHost(t, addr, tmp)
 	defer h.Close()
+
+	if n := accepted(); n != 0 {
+		t.Fatalf("NewSSHHost 不应立即拨号，已接受 %d 个连接", n)
+	}
 
 	// Ls 会触发首次连接 + 平台探测：应有 app.log 与 sub/，没有 ignore.txt
 	nodes, err := h.Ls(tmp)
@@ -231,13 +239,27 @@ func TestSSHIntegration_LsStatOpen(t *testing.T) {
 
 	// 远程命令管道在真实机器上验证；内嵌测试服务器只实现了 uname 与 sftp 子系统，
 	// 不具备执行 sh 管道的能力。
+
+	// 连接复用：Ls 触发首次拨号后，后续 Stat/Open 应复用同一个 ssh.Client/sftp.Client，
+	// 服务器只接受过 1 个 TCP 连接（而非每次操作都重新握手）。
+	if n := accepted(); n != 1 {
+		t.Errorf("连接未复用，服务器接受了 %d 个 TCP 连接，期望 1", n)
+	}
+
+	// 再做一次 Ls，确认仍是同一连接（不会因空闲/keepalive 误触发重拨）。
+	if _, err := h.Ls(tmp); err != nil {
+		t.Fatalf("第二次 Ls 失败: %v", err)
+	}
+	if n := accepted(); n != 1 {
+		t.Errorf("重复 Ls 后服务器接受了 %d 个连接，期望仍为 1", n)
+	}
 }
 
 func TestSSHIntegration_PathTraversal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip in-process sftp server test on windows; validate against real remote host")
 	}
-	addr, cleanup := startTestSSHServer(t)
+	addr, _, cleanup := startTestSSHServer(t)
 	defer cleanup()
 
 	tmp := t.TempDir()

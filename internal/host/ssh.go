@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,9 +59,30 @@ type SSHHost struct {
 	realRoots     []string
 	caps          Capabilities
 	connected     bool
+	everConnected bool // 至少成功连通过一次：用于区分"首次连接"与"断线重连"
+	reconnects    uint64
 	lastErr       error
 	stopKeepalive chan struct{}
 	closeOnce     sync.Once
+
+	// onReconnect 在每次【断线后重连成功】时被调用（在锁外），供上层埋点
+	// （Prometheus 重连计数等）。host 包不依赖 metrics，通过该钩子倒置依赖。
+	onReconnect func()
+
+	// health 节流：避免 /healthz 高频抓取时对同一连接反复发 keepalive。
+	healthMu      sync.Mutex
+	lastHealthAt  time.Time
+	lastHealthErr error
+}
+
+// SetOnReconnect 注册断线重连成功回调。必须在首次使用前调用（非并发安全）。
+func (h *SSHHost) SetOnReconnect(fn func()) { h.onReconnect = fn }
+
+// ReconnectCount 返回累计断线重连成功次数（供健康检查/指标采样）。
+func (h *SSHHost) ReconnectCount() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reconnects
 }
 
 // NewSSHHost 构造一台远程机器 Host。initial/saveCfg 与 LocalHost 含义相同。
@@ -100,12 +121,12 @@ func NewSSHHost(name string, sshCfg appconfig.SSHConfig, platform string, dirs [
 		cfgMgr:   config.NewManager(initial, saveCfg),
 	}
 	if len(cleanDirs) == 0 {
-		log.Printf("[ssh] %s: 未配置任何扫描目录（dirs），目录树将为空", name)
+		slog.Warn("SSH 主机未配置任何扫描目录（dirs），目录树将为空", "host", name)
 	}
 	// 异步做一次连接探测，让顶栏切换器尽快显示在线状态，不阻塞启动。
 	go func() {
 		if err := h.ensureConnected(); err != nil {
-			log.Printf("[ssh] %s: 初始连接失败: %v", name, err)
+			slog.Error("SSH 初始连接失败", "host", name, "err", err)
 		}
 	}()
 	return h, nil
@@ -276,7 +297,7 @@ func (h *SSHHost) ensureConnected() error {
 		select {
 		case <-initDone:
 		case <-time.After(2 * time.Second):
-			log.Printf("[ssh] %s: 初始化超时后后台清理未在 2s 内返回，放弃等待", h.name)
+			slog.Warn("SSH 初始化超时后后台清理未在 2s 内返回，放弃等待", "host", h.name)
 		}
 		return h.recordErr(fmt.Errorf("SSH 初始化超时（SFTP/平台/能力探测超过 %s）", timeout))
 	}
@@ -290,21 +311,36 @@ func (h *SSHHost) ensureConnected() error {
 	sc, platform, realRoots, caps := res.sc, res.platform, res.realRoots, res.caps
 
 	h.mu.Lock()
+	// 区分"首次连接"与"断线重连"：曾经连通过，本次又是一次新的拨号，即一次重连。
+	isReconnect := h.everConnected
 	h.client = client
 	h.sftpClient = sc
 	h.realPlatform = platform
 	h.realRoots = realRoots
 	h.caps = caps
 	h.connected = true
+	h.everConnected = true
+	if isReconnect {
+		h.reconnects++
+	}
 	h.lastErr = nil
 	stop := make(chan struct{})
 	h.stopKeepalive = stop
+	onReconn := h.onReconnect
 	h.mu.Unlock()
 
-	log.Printf("[ssh] %s: 已连接（平台=%s，tail=%v cat=%v grep=%v awk=%v iconv=%v）",
-		h.name, platform, caps.HasTail, caps.HasCat, caps.HasGrep, caps.HasAwk, caps.HasIconv)
+	// 重连埋点在锁外触发，避免回调反向抢锁。
+	if isReconnect && onReconn != nil {
+		onReconn()
+	}
+
+	slog.Info("SSH 已连接",
+		"host", h.name, "platform", platform,
+		"tail", caps.HasTail, "cat", caps.HasCat, "grep", caps.HasGrep,
+		"awk", caps.HasAwk, "iconv", caps.HasIconv, "reconnect", isReconnect)
 	if !caps.HasIconv || !caps.HasAwk {
-		log.Printf("[ssh] %s: 远端缺少部分命令（GBK 转码需 iconv，时间过滤需 awk），相关功能将被禁用", h.name)
+		slog.Warn("SSH 远端缺少部分命令，相关功能将被禁用（GBK 转码需 iconv，时间过滤需 awk）",
+			"host", h.name, "iconv", caps.HasIconv, "awk", caps.HasAwk)
 	}
 	go h.keepalive(stop)
 	return nil
@@ -355,6 +391,56 @@ func (h *SSHHost) Capabilities() Capabilities {
 	return h.caps
 }
 
+// healthThrottle 探活结果缓存窗口：窗口内复用上次结果，避免高频抓取时反复握手。
+const healthThrottle = 2 * time.Second
+
+// HealthCheck 复用当前 SSH 连接发一次 keepalive@openssh.com 请求（不新建会话/通道），
+// 失败则返回错误。结果在 healthThrottle 窗口内缓存。
+func (h *SSHHost) HealthCheck() error {
+	h.healthMu.Lock()
+	defer h.healthMu.Unlock()
+	if time.Since(h.lastHealthAt) < healthThrottle {
+		return h.lastHealthErr
+	}
+	h.mu.Lock()
+	client := h.client
+	h.mu.Unlock()
+
+	var err error
+	if client == nil {
+		// 当前未连接：尝试一次懒重连（ensureConnected 内部有重连串行化）。
+		err = h.ensureConnected()
+	} else {
+		// SendRequest 会阻塞直到对端应答或网络超时；用短超时包裹，避免 /healthz 卡死。
+		done := make(chan error, 1)
+		go func() {
+			_, _, e := client.SendRequest("keepalive@openssh.com", true, nil)
+			done <- e
+		}()
+		timeout := time.Duration(h.sshCfg.ConnectTimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		select {
+		case e := <-done:
+			if e != nil {
+				// keepalive 失败：拆除失效连接，下次操作自动重连。
+				h.invalidateConn(client)
+				err = fmt.Errorf("SSH keepalive 失败: %w", e)
+			}
+		case <-time.After(timeout):
+			h.invalidateConn(client)
+			err = fmt.Errorf("SSH keepalive 超时（%s）", timeout)
+		}
+	}
+	h.lastHealthAt = time.Now()
+	h.lastHealthErr = err
+	if err != nil {
+		h.recordErr(err)
+	}
+	return err
+}
+
 func (h *SSHHost) recordErr(err error) error {
 	h.mu.Lock()
 	h.lastErr = err
@@ -383,7 +469,7 @@ func (h *SSHHost) keepalive(stop chan struct{}) {
 			}
 			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 			if err != nil {
-				log.Printf("[ssh] %s: keepalive 失败，将重连: %v", h.name, err)
+				slog.Warn("SSH keepalive 失败，将重连", "host", h.name, "err", err)
 				// 用比较拆除：仅当当前连接仍是这个失败的 client 时才关闭。
 				// 否则可能有在途操作已触发重连、换上了新连接，不能误杀。
 				h.invalidateConn(client)
@@ -467,7 +553,7 @@ func (h *SSHHost) withSFTP(fn func(*sftp.Client) error) error {
 	}
 	err := fn(sc)
 	if err != nil && isConnErr(err) {
-		log.Printf("[ssh] %s: SFTP 操作失败，断开重连一次: %v", h.name, err)
+		slog.Warn("SFTP 操作失败，断开重连一次", "host", h.name, "err", err)
 		h.invalidateConn(cl)
 		if err2 := h.ensureConnected(); err2 != nil {
 			return err // 重连失败返回原始连接错误
@@ -557,7 +643,7 @@ func runRemote(client *ssh.Client, cmdline string) ([]byte, error) {
 
 func (h *SSHHost) hostKeyCallback() (ssh.HostKeyCallback, error) {
 	if h.sshCfg.InsecureSkipHostKey {
-		log.Printf("[ssh] %s: 警告！insecure_skip_host_key=true，已跳过主机密钥校验，存在中间人风险", h.name)
+		slog.Warn("insecure_skip_host_key=true，已跳过主机密钥校验，存在中间人风险", "host", h.name)
 		return ssh.InsecureIgnoreHostKey(), nil
 	}
 
@@ -617,7 +703,7 @@ func (h *SSHHost) hostKeyCallback() (ssh.HostKeyCallback, error) {
 		if closeErr != nil {
 			return fmt.Errorf("写入 known_hosts 失败: %w", closeErr)
 		}
-		log.Printf("[ssh] %s: 首次连接，主机密钥已写入 %s", h.name, khFile)
+		slog.Info("首次连接，主机密钥已写入 known_hosts", "host", h.name, "known_hosts", khFile)
 		return nil
 	}, nil
 }

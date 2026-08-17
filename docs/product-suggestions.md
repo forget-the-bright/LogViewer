@@ -41,26 +41,47 @@
 
 ## 五、界面与体验
 
-- **★★ 暗色/亮色主题跟随系统**：加 `prefers-color-scheme` 检测，首次访问自动匹配。
-- **★ 移动端响应式适配**：小屏下顶栏折叠、侧栏全屏覆盖、配置面板改为抽屉。
-- **★★ 键盘快捷键体系**：`/` 聚焦搜索、`t` 切跟踪/静态、`s` 开始/停止、`g` 顶部、`G` 底部、
-  `[`/`]` 切换标签页等，带 ? 快捷键浮层。
-- **★ 国际化**：中/英双语切换（当前硬编码中文）。
-- **★ 紧凑/舒适密度**：终端字号、行高可调节并持久化。
-- **★ 命令面板**：Ctrl+Shift+P 模糊搜索所有操作（类似 VS Code）。
+- ✅ **暗色/亮色主题跟随系统**：`prefers-color-scheme` 检测 + 自动/白天/黑夜三态，手动切换后停止跟随，
+  持久化到 `logviewer-prefs`，xterm 配色同步。
+- ✅ **移动端响应式适配**：`@media (max-width:768px)` 汉堡菜单、侧栏全屏覆盖、配置面板底部抽屉。
+- ✅ **键盘快捷键体系**：统一 `initShortcuts()`，`/ t s g G PgUp/PgDn ? Ctrl+Shift+P` 全量接线，
+  输入框焦点守卫（`isTyping()`），`?` 快捷键浮层；`[`/`]` 预留给多标签页。
+- ✅ **国际化**：新增 `static/i18n.js`（中/英），静态 DOM 用 `data-i18n`、动态串用 `t()`；
+  `i18n.test.mjs` 校验两套键集合一致，硬编码中文已全部迁移。
+- ✅ **紧凑/舒适密度**：字号（12–18）、行高（1.0–1.6）在设置抽屉调节并持久化。
+- ✅ **命令面板**：`Ctrl+Shift+P` 唤起，子序列模糊匹配，覆盖开始/停止/清空/导出/切主题/跳转等全部操作。
+- ✅ **滚动悬浮按钮**：依据 `viewportY/baseY/length` 智能显隐的回到顶/底按钮，上滚时"到底部"兼作继续跟踪。
+- ✅ **P0 全局快捷键根因修复**：xterm 在**捕获阶段** `preventDefault` 杀死 Ctrl+F；Ctrl+C 被解析为 ETX
+  导致浏览器原生 copy 不触发、xterm 的 `copyHandler` 不执行。通过 `attachCustomKeyEventHandler` 对
+  这些组合键返回 `false`（不阻止冒泡/默认行为）根治，而非临时屏蔽事件。
 
 ## 六、可靠性与性能
 
-- **★★ 断线状态下保留缓冲**：WS 短暂断开重连后，自动补齐 gap 期间的日志（需要服务端按序号/时间戳补推）。
-- **★ 前端虚拟滚动优化**：超长 scrollback 时评估 xterm.js 性能，必要时分片渲染。
-- **★ 日志文件轮转体验**：跟踪中文件被 rotate 时给出提示（tail -F 已自动跟进，但 UI 可提示"检测到日志轮转"）。
-- **★ SSH 连接池**：同一主机的多次操作复用 SSH 客户端（当前已有 client 复用，可进一步复用 SFTP 会话）。
+- ✅ **断线状态下保留缓冲**：follow 会话与 WS 连接解耦（`viewSession`），进程持续运行，输出写入 2MB 有界
+  环形缓冲并分配单调 `seq`；断线进入宽限期（`session_grace_seconds`，默认 45s），重连发 `attach` 按
+  `lastSeq` 补发缺口；`lastSeq < oldestSeq`（已淘汰）时下发 `gap` 通知；`writeMu` 保证补发先于实时帧。
+  静态模式仍连接绑定（断了重来，无补齐意义）。
+- ✅ **前端虚拟滚动评估**：经核实 xterm.js 自身已对 viewport 做 canvas/DOM 复用的虚拟化渲染，真正的杠杆是
+  `scrollback` 上限与写入批量化，而非重写渲染层。`scrollback` 已可配置（设置抽屉 5k/10k/20k/50k，默认 10k，
+  持久化，下次启动生效）；写入仍由 procmgr 40ms/512 行批量保证。服务端管道压测 20 万行约 25ms 排空
+  （~8M 行/s，见 `BenchmarkReadLoopThroughput`）；浏览器渲染压测页 `static/bench.html` 可实测耗时/堆内存。
+- ✅ **日志文件轮转体验**：`classifyStderr` 区分 `tail -F` 的"文件出现/建立"（良性忽略）、"被替换/轮转"
+  （notice rotate）、"文件截断"（notice truncate）与真实错误；前端显示可关闭的非红色提示条。
+- ✅ **SSH 连接池（核实）**：`ssh.Client` 与 `sftp.Client` 已是单例复用（`ensureConnected`/`withSFTP`），
+  每条远程命令的 session 因需独立 stdio/信号天然每次新建；重连走 `invalidateConn(old)` 比较拆除避免误杀新连接，
+  并通过 `onReconnect` 回调累加 `logviewer_ssh_reconnects_total`。新增测试断言连续 Ls/Stat/Open 只产生 1 个
+  TCP 连接（`TestSSHIntegration_LsStatOpen`）。
 
 ## 七、可观测性
 
-- **★ 自身健康端点**：`/healthz` 返回各主机连通状态，方便接入监控。
-- **★ Prometheus 指标**：活跃 WS 连接数、日志进程数、SSH 重连次数、导出字节数等。
-- **★ 结构化日志**：服务端自身日志可选 JSON 格式输出，便于采集。
+- ✅ **自身健康端点**：`GET /healthz`（免鉴权）返回 `{status, hosts:[{name,online,available,message}]}`，
+  SSH 主机经节流（2s）的 keepalive 探活。
+- ✅ **Prometheus 指标**：`GET /metrics`（promhttp，免鉴权）暴露 `logviewer_ws_connections`、
+  `logviewer_log_processes`、`logviewer_ssh_reconnects_total`、`logviewer_export_bytes_total`、
+  `logviewer_log_bytes_sent_total`。
+- ✅ **结构化日志**：`log_json`（默认 false 文本）与 `log_level`（默认 info）配置；`internal/applog`
+  早期初始化 slog 并重定向标准库 `log`，高价值调用点（启动/启动查看/SSH 连接与重连/导出/重载/关闭）
+  已迁移为带 `host`/`file`/`mode`/`shell` 字段的结构化日志。
 
 ---
 

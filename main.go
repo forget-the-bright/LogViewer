@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -18,9 +19,11 @@ import (
 	"time"
 
 	"logviewer/internal/appconfig"
+	"logviewer/internal/applog"
 	"logviewer/internal/config"
 	"logviewer/internal/cryptoutil"
 	"logviewer/internal/host"
+	"logviewer/internal/metrics"
 	"logviewer/internal/server"
 )
 
@@ -100,7 +103,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
-	log.Printf("配置文件: %s", cfgPath)
+	// 尽早初始化结构化日志：此后所有 log.Printf 都会被重定向到 slog。
+	applog.Init(appCfg.LogJSON, appCfg.LogLevel)
+	slog.Info("配置文件已加载", "path", cfgPath, "log_json", appCfg.LogJSON, "log_level", appCfg.LogLevel)
 
 	// 如果配置中有加密密码，必须提供密钥并在内存中解密
 	if appCfg.HasEncryptedPasswords() {
@@ -110,7 +115,7 @@ func main() {
 		if err := appCfg.DecryptPasswords(key); err != nil {
 			log.Fatalf("解密配置密码失败: %v", err)
 		}
-		log.Printf("已使用密钥在内存中解密配置密码")
+		slog.Info("已使用密钥在内存中解密配置密码")
 	}
 
 	listenAddr := *addr
@@ -124,15 +129,15 @@ func main() {
 		log.Fatalf("初始化机器失败: %v", err)
 	}
 	for _, info := range hm.List() {
-		kind := "本机"
+		kind := "local"
 		if !info.Local {
-			kind = "SSH"
+			kind = "ssh"
 		}
 		platform := info.Platform
 		if platform == "" {
-			platform = "探测中"
+			platform = "probing"
 		}
-		log.Printf("机器: [%s] %s (%s) dirs=%v", kind, info.Name, platform, dirsOf(hm, info.Name))
+		slog.Info("主机已注册", "kind", kind, "name", info.Name, "platform", platform, "dirs", dirsOf(hm, info.Name))
 	}
 
 	// 配置变更时的持久化闭包（保留 appCfg 引用供 reload 使用）
@@ -168,11 +173,12 @@ func main() {
 	}
 
 	srv := server.New(server.Options{
-		Hosts:      hm,
-		Static:     sub,
-		Auth:       appCfg.Auth,
-		ConfigPath: cfgPath,
-		ReloadFunc: reloadCfg,
+		Hosts:        hm,
+		Static:       sub,
+		Auth:         appCfg.Auth,
+		ConfigPath:   cfgPath,
+		SessionGrace: time.Duration(appCfg.SessionGraceSeconds) * time.Second,
+		ReloadFunc:   reloadCfg,
 	})
 	displayAddr := listenAddr
 	if strings.HasPrefix(displayAddr, ":") {
@@ -193,36 +199,39 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-sigCh:
-				log.Printf("收到 SIGHUP，正在重新加载配置...")
+				slog.Info("收到 SIGHUP，正在重新加载配置")
 				if newCfg, changed, err := reloadCfg(); err != nil {
-					log.Printf("配置重载失败: %v", err)
+					slog.Error("配置重载失败", "err", err)
 				} else {
+					// 日志配置可能在 reload 中被改动，重新初始化。
+					applog.Init(newCfg.LogJSON, newCfg.LogLevel)
 					srv.UpdateAuth(newCfg.Auth)
 					if n := srv.NotifyHostsChanged(changed); n > 0 {
-						log.Printf("已通知 %d 个连接因主机配置变更重连", n)
+						slog.Info("已通知连接因主机配置变更重连", "connections", n)
 					}
-					log.Printf("配置重载成功，共 %d 台机器", len(newCfg.Hosts))
+					slog.Info("配置重载成功", "hosts", len(newCfg.Hosts))
 				}
 			}
 		}
 	}()
 
 	go func() {
-		log.Printf("LogViewer %s 启动，访问 http://%s", version, displayAddr)
+		slog.Info("LogViewer 启动", "version", version, "addr", "http://"+displayAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("服务启动失败: %v", err)
+			slog.Error("服务启动失败", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Printf("收到退出信号，正在关闭（停止日志进程与远程连接）...")
+	slog.Info("收到退出信号，正在关闭（停止日志进程与远程连接）")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP 关闭超时: %v", err)
+		slog.Error("HTTP 关闭超时", "err", err)
 	}
 	srv.Close()
-	log.Printf("已退出")
+	slog.Info("已退出")
 }
 
 func authEnabled(cfg *appconfig.AppConfig) bool {
@@ -232,13 +241,13 @@ func authEnabled(cfg *appconfig.AppConfig) bool {
 func logStartupWarnings(cfg *appconfig.AppConfig, addr string) {
 	if authEnabled(cfg) {
 		ttl := time.Duration(cfg.Auth.SessionTTLMinutes) * time.Minute
-		log.Printf("登录认证已启用（用户: %s，会话有效期: %s）", cfg.Auth.Username, ttl)
+		slog.Info("登录认证已启用", "user", cfg.Auth.Username, "ttl", ttl.String())
 		pw := cfg.Auth.Password
 		if !appconfig.IsBcryptHash(pw) && !cryptoutil.IsEncrypted(pw) {
-			log.Printf("警告: auth.password 为明文，建议用 `logviewer -hash-password <明文>` 生成 bcrypt 哈希后填写")
+			slog.Warn("auth.password 为明文，建议用 `logviewer -hash-password <明文>` 生成 bcrypt 哈希后填写")
 		}
 	} else {
-		log.Printf("登录认证未启用（auth.enabled=false 或用户名为空），所有功能可直接访问")
+		slog.Info("登录认证未启用（auth.enabled=false 或用户名为空），所有功能可直接访问")
 	}
 	host := addr
 	if strings.HasPrefix(host, ":") {
@@ -247,7 +256,7 @@ func logStartupWarnings(cfg *appconfig.AppConfig, addr string) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		h = strings.Trim(h, "[]")
 		if h != "127.0.0.1" && h != "localhost" && h != "::1" && !authEnabled(cfg) {
-			log.Printf("警告: 监听在非本机地址 %s 但未启用登录认证，存在未授权访问风险", h)
+			slog.Warn("监听在非本机地址但未启用登录认证，存在未授权访问风险", "host", h)
 		}
 	}
 }
@@ -280,6 +289,12 @@ func buildHosts(appCfg *appconfig.AppConfig, cfgPath string) ([]host.Host, error
 		if err != nil {
 			return nil, fmt.Errorf("初始化机器 %q 失败: %w", name, err)
 		}
+		// 重连成功时累加 Prometheus 指标 + 结构化日志（host 包不依赖 metrics）。
+		hostName := name
+		sh.SetOnReconnect(func() {
+			metrics.IncSSHReconnect(hostName)
+			slog.Warn("SSH 断线后重连成功", "host", hostName)
+		})
 		hosts = append(hosts, sh)
 	}
 	return hosts, nil

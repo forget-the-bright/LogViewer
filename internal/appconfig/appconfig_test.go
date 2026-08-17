@@ -147,10 +147,26 @@ func TestValidate(t *testing.T) {
 		t.Error("missing username should fail")
 	}
 
-	good := &AppConfig{Hosts: map[string]HostConfig{
-		"remote": {SSH: &SSHConfig{Host: "1.2.3.4", Username: "u", Password: "p"}},
-	}}
+	good := &AppConfig{
+		LogLevel:            "info",
+		SessionGraceSeconds: 45,
+		Hosts: map[string]HostConfig{
+			"remote": {SSH: &SSHConfig{Host: "1.2.3.4", Username: "u", Password: "p"}},
+		},
+	}
 	if err := good.Validate(); err != nil {
 		t.Errorf("good config failed: %v", err)
+	}
+
+	badLevel := *good
+	badLevel.LogLevel = "verbose"
+	if err := badLevel.Validate(); err == nil {
+		t.Error("invalid log_level should fail")
+	}
+
+	badGrace := *good
+	badGrace.SessionGraceSeconds = 2
+	if err := badGrace.Validate(); err == nil {
+		t.Error("session_grace_seconds below 5 should fail")
 	}
 }

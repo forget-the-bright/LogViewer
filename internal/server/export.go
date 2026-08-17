@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -16,8 +16,22 @@ import (
 
 	"logviewer/internal/cmdbuild"
 	"logviewer/internal/config"
+	"logviewer/internal/metrics"
 	"logviewer/internal/procmgr"
 )
+
+// countingWriter 包装一个 io.Writer，累计写入字节数。用于把导出量计入
+// Prometheus 指标（logviewer_export_bytes_total）。
+type countingWriter struct {
+	w    io.Writer
+	kind string
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	metrics.IncExportBytes(c.kind, int64(n))
+	return n, err
+}
 
 // contentDisposition 构造 Content-Disposition 响应头，正确处理非 ASCII 文件名。
 //
@@ -61,7 +75,7 @@ func baseName(p string) string {
 // 关键：同时排空 stderr。导出是流式输出，一旦首字节写出就无法再改 HTTP 状态码；
 // 但如果命令在写出任何字节前就失败（文件不存在、权限拒绝等），我们还没发响应头，
 // 此时把 stderr 转成 JSON 错误返回 4xx/5xx，避免用户下到一个 0 字节的"成功"文件。
-func streamProcessToResponse(c *gin.Context, p procmgr.Process) {
+func streamProcessToResponse(c *gin.Context, p procmgr.Process, metricKind string) {
 	stdout, err := p.StdoutPipe()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "管道错误: " + err.Error()})
@@ -106,7 +120,7 @@ func streamProcessToResponse(c *gin.Context, p procmgr.Process) {
 
 	// 用 firstByteWriter 拦截首字节写出：在它之前若进程提前退出且无输出，
 	// 响应头尚未发送，可以安全地改回 JSON 错误。
-	fbw := &firstByteWriter{w: c.Writer}
+	fbw := &firstByteWriter{w: &countingWriter{w: c.Writer, kind: metricKind}}
 	_, copyErr := io.Copy(fbw, stdout)
 	<-errDone
 	close(done)
@@ -125,7 +139,7 @@ func streamProcessToResponse(c *gin.Context, p procmgr.Process) {
 	}
 	// 已写出过字节：响应头已发，中途错误无法再改状态码（仅服务端可见）。
 	if copyErr != nil {
-		log.Printf("[export] 流式输出中途出错: %v", copyErr)
+		slog.Error("导出流式输出中途出错", "kind", metricKind, "err", copyErr)
 	}
 }
 
@@ -203,7 +217,7 @@ func (s *Server) handleDownloadOrigin(c *gin.Context) {
 		return
 	}
 	defer rc.Close()
-	_, _ = io.Copy(c.Writer, rc)
+	_, _ = io.Copy(&countingWriter{w: c.Writer, kind: "origin"}, rc)
 }
 
 // handleDownloadFilter 导出过滤后的日志。
@@ -275,11 +289,11 @@ func (s *Server) handleDownloadFilter(c *gin.Context) {
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 
 	exportCmd := cmdbuild.BuildExport(h.Platform(), abs, cfg.Encoding, cfg.ReadLinesLimit, f)
-	log.Printf("[export] host=%s file=%s shell=%s", h.Name(), baseName(abs), exportCmd.Shell)
+	slog.Info("导出日志", "host", h.Name(), "file", baseName(abs), "shell", exportCmd.Shell)
 	proc, err := h.Run(exportCmd)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "启动命令失败: " + err.Error()})
 		return
 	}
-	streamProcessToResponse(c, proc)
+	streamProcessToResponse(c, proc, "filter")
 }

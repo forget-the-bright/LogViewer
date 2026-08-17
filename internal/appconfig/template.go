@@ -39,6 +39,15 @@ func defaultTemplate() string {
     "session_ttl_minutes": 720
   },
 
+  // 服务端自身日志输出。
+  // log_json=true 输出 JSON 结构化日志（便于日志采集系统消费）；false 输出人类可读文本。
+  "log_json": false,
+  // 日志级别：debug / info / warn / error，默认 info。
+  "log_level": "info",
+  // follow 跟踪模式下，WebSocket 断线后服务端保留会话（继续缓冲日志）的宽限秒数。
+  // 在此期间重连可自动补齐断连间隙的日志；超时则回收进程。默认 45，范围 5-3600。
+  "session_grace_seconds": 45,
+
 
   "hosts": {
     "local": {

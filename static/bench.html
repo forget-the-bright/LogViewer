@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="robots" content="noindex" />
+<title>xterm write benchmark (dev-only)</title>
+<link rel="stylesheet" href="/static/vendor/xterm.css" />
+<style>
+  body { margin: 0; font: 13px/1.5 system-ui, sans-serif; background:#1e1e1e; color:#ddd; }
+  #bar { padding: 8px 12px; display: flex; gap: 12px; align-items: center; background:#252526; border-bottom:1px solid #333; }
+  button { padding: 4px 12px; }
+  #terminal { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; }
+  #out { color:#9cdcfe; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>xterm write benchmark</strong>
+  <label>lines <input id="lines" type="number" value="200000" style="width:90px" /></label>
+  <label>scrollback <input id="sb" type="number" value="10000" style="width:90px" /></label>
+  <label>batch <input id="batch" type="number" value="512" style="width:70px" /></label>
+  <button id="run">Run</button>
+  <span id="out"></span>
+</div>
+<div id="terminal"></div>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/fit.js"></script>
+<script>
+(function () {
+  "use strict";
+  var term = new Terminal({
+    scrollback: parseInt(document.getElementById("sb").value, 10),
+    convertEol: false,
+    disableStdin: true,
+    fontSize: 13,
+    lineHeight: 1.2,
+    theme: { background: "#1e1e1e" },
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById("terminal"));
+  fit.fit();
+
+  function run() {
+    var total = parseInt(document.getElementById("lines").value, 10);
+    var batchSize = parseInt(document.getElementById("batch").value, 10);
+    var out = document.getElementById("out");
+    term.reset();
+    term.clear();
+    // 构造一批行，模拟真实日志长度
+    var sample = "2026-08-17 12:00:00 INFO  benchmark line with some padding to mimic a real log entry ";
+    var batches = [];
+    var buf = "";
+    var n = 0;
+    while (n < total) {
+      buf += sample + n + "\n";
+      n++;
+      if (n % batchSize === 0) { batches.push(buf); buf = ""; }
+    }
+    if (buf) batches.push(buf);
+
+    out.textContent = "writing " + total + " lines in " + batches.length + " batches...";
+    // 让出一帧后开始，确保 reset 已渲染
+    setTimeout(function () {
+      var start = performance.now();
+      var memBefore = performance.memory ? performance.memory.usedJSHeapSize : 0;
+      var i = 0;
+      function step() {
+        var chunkStart = performance.now();
+        // 每个动画帧写入若干批，保持 UI 响应
+        var guard = 0;
+        while (i < batches.length && guard < 8) {
+          term.write(batches[i]);
+          i++;
+          guard++;
+        }
+        if (i < batches.length) {
+          requestAnimationFrame(step);
+        } else {
+          // 等 xterm 排空内部写队列后再计时
+          term.write("", function () {
+            var elapsed = performance.now() - start;
+            var memAfter = performance.memory ? performance.memory.usedJSHeapSize : 0;
+            var lps = Math.round(total / (elapsed / 1000));
+            var memMB = memAfter ? ((memAfter - memBefore) / 1048576).toFixed(1) + " MB" : "n/a";
+            out.textContent = "done: " + total + " lines in " +
+              elapsed.toFixed(0) + " ms (~" + lps.toLocaleString() + " lines/s), " +
+              "js heap delta " + memMB + ", buffer.length=" + term.buffer.active.length;
+          });
+        }
+      }
+      requestAnimationFrame(step);
+    }, 50);
+  }
+
+  document.getElementById("run").addEventListener("click", run);
+  window.addEventListener("resize", function () { fit.fit(); });
+})();
+</script>
+</body>
+</html>

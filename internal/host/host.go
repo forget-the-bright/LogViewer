@@ -47,6 +47,11 @@ type Host interface {
 	// Capabilities 返回远端命令能力（本机恒为全部 true）。
 	Capabilities() Capabilities
 
+	// HealthCheck 对主机做一次轻量探活，返回 nil 表示可用。
+	// 本机恒为 nil；远程主机复用已有 SSH 连接发 keepalive 请求（不新建会话），
+	// 失败时返回错误。实现可在内部做短时节流，避免 /healthz 高频抓取时反复握手。
+	HealthCheck() error
+
 	// ResolvePath 校验 p 在允许的根目录内（含符号链接逃逸检测），
 	// 返回可用于后续 Stat/Open/Run 的规范化路径。每次用户输入只应调用一次：
 	// 后续 Stat/Open 直接复用返回的 abs，不再重复解析（SSH 下重复会产生

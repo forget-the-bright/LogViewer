@@ -3,6 +3,7 @@ package procmgr
 import (
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,4 +61,49 @@ func TestStartSuccessNoImmediateKill(t *testing.T) {
 		t.Fatal("成功路径不应在启动后立即 Kill")
 	}
 	m.Stop(id)
+}
+
+// emitProc 模拟一个产生大量 stdout 的进程，用于压测 readLoop 的读取+批量 flush 吞吐。
+type emitProc struct {
+	r io.Reader
+}
+
+func (p *emitProc) StdoutPipe() (io.Reader, error) { return p.r, nil }
+func (p *emitProc) StderrPipe() (io.Reader, error) { return strings.NewReader(""), nil }
+func (p *emitProc) Start() error                    { return nil }
+func (p *emitProc) Kill() error                     { return nil }
+func (p *emitProc) Wait() error                     { return nil }
+
+// BenchmarkReadLoopThroughput 压测服务端"读取→按行攒批→flush"管道的吞吐。
+// 这是 Go 侧唯一承担的数据搬运环节（日志内容由原生 tail/grep 产出），验证大批量
+// 历史数据（20 万行量级）能被快速排空、不会因逐行同步 WebSocket 写而堆积。
+func BenchmarkReadLoopThroughput(b *testing.B) {
+	const lines = 200_000
+	var sb strings.Builder
+	for i := 0; i < lines; i++ {
+		sb.WriteString("2026-08-17 12:00:00 INFO  benchmark line with some padding to mimic a real log entry number ")
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteByte('\n')
+	}
+	payload := sb.String()
+	b.SetBytes(int64(len(payload) / lines))
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		m := NewManager()
+		got := 0
+		done := make(chan struct{})
+		p := &emitProc{r: strings.NewReader(payload)}
+		id, err := m.Start(p, func(batch string) {
+			got += strings.Count(batch, "\n")
+		}, nil, func() { close(done) })
+		if err != nil {
+			b.Fatalf("Start 失败: %v", err)
+		}
+		<-done
+		if got != lines {
+			b.Fatalf("排空行数 = %d, want %d", got, lines)
+		}
+		m.Stop(id)
+	}
 }

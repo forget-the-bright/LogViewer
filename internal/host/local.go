@@ -119,6 +119,9 @@ func (h *LocalHost) Capabilities() Capabilities {
 	return Capabilities{HasTail: true, HasCat: true, HasGrep: true, HasAwk: true, HasIconv: true}
 }
 
+// HealthCheck 本机恒可用。
+func (h *LocalHost) HealthCheck() error { return nil }
+
 // ResolvePath 校验 p 位于某个允许根目录内。
 // 与旧实现相比新增了符号链接逃逸检测：若 p（或其父目录，当 p 不存在时）
 // 经 EvalSymlinks 解析后跳出根目录，一律拒绝。

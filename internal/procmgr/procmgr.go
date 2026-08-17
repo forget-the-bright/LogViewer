@@ -51,6 +51,13 @@ func NewManager() *Manager {
 	return &Manager{procs: make(map[uint64]*procRecord)}
 }
 
+// Count 返回当前正在运行的进程数（供可观测性指标采样）。
+func (m *Manager) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.procs)
+}
+
 // Start 启动进程并异步读取 stdout/stderr。
 //
 //	outFn: 收到一批 stdout 数据时回调（命令已完成过滤/编码，Go 只转发）

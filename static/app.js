@@ -20,6 +20,8 @@
     selectedNode: null,
     activeConfig: null,   // 最近一次 start 使用的配置（断线重连自动恢复用）
     pendingResume: null,  // 连接建立后需要自动重发的 {filePath, config}
+    sessionID: "",        // 当前 follow 会话 ID（服务端断线宽限补齐用）
+    lastSeq: 0,           // 最近一帧日志的序号（attach 时据此补发缺口）
   };
 
   // 统一复位暂停相关状态：切换文件/主机、断线、停止、开始时都必须调用，
@@ -30,7 +32,7 @@
     state.pausedBufferChars = 0;
     state.pausedDropped = 0;
     const pb = $("pauseBtn");
-    if (pb) pb.textContent = "暂停";
+    if (pb) pb.textContent = t("pause");
   }
 
   // WebSocket 指数退避重连
@@ -47,6 +49,60 @@
 
   // ---------- 工具 ----------
   const $ = (id) => document.getElementById(id);
+
+  // ============ 偏好设置（localStorage 持久化）============
+  const PREFS_KEY = "logviewer-prefs";
+  const DEFAULT_PREFS = {
+    themeMode: "auto", // auto | light | dark
+    lang: "",          // "" 表示按浏览器语言自动判定
+    density: "comfortable", // compact | comfortable
+    fontSize: 13,
+    lineHeight: 1.2,
+    scrollback: 10000,
+  };
+
+  function loadPrefs() {
+    let p = {};
+    try { p = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") || {}; } catch (e) { p = {}; }
+    // 兼容旧键 logviewer-theme（明暗写死），无则默认 auto。
+    if (!p.themeMode) {
+      try {
+        const oldTheme = localStorage.getItem("logviewer-theme");
+        if (oldTheme === "light" || oldTheme === "dark") p.themeMode = oldTheme;
+      } catch (e) {}
+    }
+    return Object.assign({}, DEFAULT_PREFS, p);
+  }
+  function savePrefs(patch) {
+    const cur = loadPrefs();
+    const next = Object.assign(cur, patch);
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(next)); } catch (e) {}
+    return next;
+  }
+  let prefs = loadPrefs();
+
+  // ============ 国际化 ============
+  function detectLang() {
+    if (prefs.lang === "zh" || prefs.lang === "en") return prefs.lang;
+    const nav = (navigator.language || "zh").toLowerCase();
+    return nav.startsWith("zh") ? "zh" : "en";
+  }
+  function t(key, params) { return window.I18N.t(key, params); }
+  function applyI18n() {
+    window.I18N.setLang(prefs.lang || detectLang());
+    document.documentElement.lang = window.I18N.lang === "en" ? "en" : "zh-CN";
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      el.textContent = t(el.getAttribute("data-i18n"));
+    });
+    document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+      el.placeholder = t(el.getAttribute("data-i18n-placeholder"));
+    });
+    document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+      el.title = t(el.getAttribute("data-i18n-title"));
+    });
+    const langSel = $("langSelect");
+    if (langSel) langSel.value = window.I18N.lang;
+  }
 
   function toast(msg, type) {
     const t = $("toast");
@@ -101,11 +157,11 @@
     const r = await fetch(url, opts);
     if (r.status === 401 && authEnabled) {
       showLogin();
-      throw new Error("未登录或会话已过期");
+      throw new Error(t("toastSessionExpired"));
     }
     const ct = r.headers.get("content-type") || "";
     const data = ct.includes("json") ? await r.json().catch(() => ({})) : {};
-    if (!r.ok) throw new Error(data.error || ("请求失败 " + r.status));
+    if (!r.ok) throw new Error(data.error || (t("requestFailed") + r.status));
     return data;
   }
 
@@ -117,7 +173,10 @@
   function setConnStatus(mode) {
     const el = $("connStatus");
     el.className = "status " + mode;
-    const labels = { online: "已连接", offline: "未连接", running: "读取中", stopping: "停止中" };
+    const labels = {
+      online: t("connOnline"), offline: t("connOffline"),
+      running: t("connRunning"), stopping: t("connStopping"),
+    };
     $("connText").textContent = labels[mode] || mode;
   }
 
@@ -126,15 +185,32 @@
     dark: { background: "#1e1e1e", foreground: "#d4d4d4", cursor: "#d4d4d4", selectionBackground: "#264f78" },
     light: { background: "#ffffff", foreground: "#1f2328", cursor: "#1f2328", selectionBackground: "#cfe4ff" },
   };
+  const mql = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+  function systemTheme() { return mql && mql.matches ? "light" : "dark"; }
   function currentTheme() {
     return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
   }
-  function applyTheme(theme) {
+  // 解析 themeMode（auto/light/dark）到实际明暗。
+  function resolveTheme(mode) {
+    if (mode === "light" || mode === "dark") return mode;
+    return systemTheme();
+  }
+  function setThemeMode(mode) {
+    prefs = savePrefs({ themeMode: mode });
+    applyTheme();
+    updateThemeSeg();
+  }
+  function applyTheme() {
+    const theme = resolveTheme(prefs.themeMode);
     document.documentElement.setAttribute("data-theme", theme);
     const btn = $("themeToggle");
-    if (btn) btn.textContent = theme === "light" ? "☀ 白天" : "🌙 黑夜";
-    const t = XTERM_THEMES[theme];
-    if (term) { try { term.options.theme = t; } catch (e) {} }
+    if (btn) {
+      const icon = theme === "light" ? "☀" : "🌙";
+      const label = prefs.themeMode === "auto" ? " " + t("settingThemeAuto") : "";
+      btn.textContent = icon + label;
+    }
+    const xt = XTERM_THEMES[theme];
+    if (term) { try { term.options.theme = xt; } catch (e) {} }
     if (gutter) {
       // 行号栏：背景略深/略浅，数字暗色，与主终端同字体
       try {
@@ -145,17 +221,26 @@
         };
       } catch (e) {}
     }
-    try { localStorage.setItem("logviewer-theme", theme); } catch (e) {}
+  }
+  // 监听系统主题变化：仅 auto 模式下跟随。
+  if (mql) {
+    const onSys = () => { if (prefs.themeMode === "auto") applyTheme(); };
+    if (mql.addEventListener) mql.addEventListener("change", onSys);
+    else if (mql.addListener) mql.addListener(onSys);
   }
 
   // ============ Xterm ============
-  const FONT_SIZE = 13;
-  const SCROLLBACK = 10000;
+  // 字号/回溯行数均来自 prefs（可在设置里调整）；行高由密度决定。
+  function fontSize() { return prefs.fontSize || 13; }
+  function lineHeight() { return prefs.lineHeight || (prefs.density === "compact" ? 1.0 : 1.2); }
+  function scrollback() { return prefs.scrollback || 10000; }
   const GUTTER_COLS = 7; // 行号栏宽度（字符列）
   let term = null;
   let gutter = null;
   let fitAddon = null;
   let searchAddon = null;
+  let searchOpen = null; // initTerminalSearch 暴露的打开搜索函数（供全局快捷键调用）
+  let searchResultLimit = 1000; // 与 searchAddon 的 highlightLimit 对齐（构造时设置）
   // 镜像游标：mirrorEndAbs 是"已镜像到的主终端绝对行号"（baseY+length 坐标系）。
   // 不能用单调递增的"已镜像行数"去和 buf.length 比——缓冲区超过 scrollback 后
   // 旧行被淘汰、buf.length 封顶，该计数会永久大于 length，导致行号栏彻底冻结。
@@ -165,8 +250,9 @@
 
   function makeTerm(opts) {
     return new Terminal(Object.assign({
-      fontSize: FONT_SIZE,
-      scrollback: SCROLLBACK,
+      fontSize: fontSize(),
+      lineHeight: lineHeight(),
+      scrollback: scrollback(),
       convertEol: false,
       fontFamily: 'Consolas, "Courier New", monospace',
       disableStdin: true,
@@ -178,6 +264,19 @@
     }, opts));
   }
 
+  // 应用字号/行高（密度）到两个终端。字号变化会改变折行点，fit 后重建行号栏。
+  function applyTerminalPrefs() {
+    const fs = fontSize(), lh = lineHeight();
+    if (term) {
+      try { term.options.fontSize = fs; term.options.lineHeight = lh; } catch (e) {}
+    }
+    if (gutter) {
+      try { gutter.options.fontSize = fs; gutter.options.lineHeight = lh; } catch (e) {}
+    }
+    document.documentElement.style.setProperty("--term-font-size", fs + "px");
+    requestAnimationFrame(() => fitTerm());
+  }
+
   try {
     term = makeTerm({ cursorBlink: true, theme: XTERM_THEMES.dark });
     fitAddon = new FitAddon.FitAddon();
@@ -185,16 +284,55 @@
     term.open($("terminal"));
 
     // 终端内搜索（xterm-addon-search）。UMD 挂在 window.SearchAddon，类为 .SearchAddon。
+    // highlightLimit：装饰高亮（及 onDidChangeResults 的 resultCount）最多计算多少个匹配。
+    // 超出后计数显示为 "N+"，避免超长缓冲区里全量装饰拖慢渲染。
+    const SEARCH_HIGHLIGHT_LIMIT = 5000;
     if (window.SearchAddon && window.SearchAddon.SearchAddon) {
-      searchAddon = new window.SearchAddon.SearchAddon();
+      searchAddon = new window.SearchAddon.SearchAddon({ highlightLimit: SEARCH_HIGHLIGHT_LIMIT });
       term.loadAddon(searchAddon);
+      searchResultLimit = SEARCH_HIGHLIGHT_LIMIT;
     }
+
+    // 关键：把浏览器/UI 快捷键从 xterm 的按键处理中“放行”。
+    //
+    // 根因（已从 vendor/xterm.js 源码确认，非猜测）：xterm 在【捕获阶段】监听其
+    // 隐藏 textarea 的 keydown。对 Ctrl+F、Ctrl+C 这类组合，evaluateKeyboardEvent
+    // 会产生 cancel=true 的终端输入键，_keyDown 随即调用 cancel(e,true) ->
+    // stopPropagation()+preventDefault()：
+    //   - Ctrl+F 的事件在冒泡到我们的 document 监听前被杀死，所以日志区按 Ctrl+F
+    //     无法唤起搜索；
+    //   - Ctrl+C 被解析为 ETX 并 preventDefault，取消了浏览器原生 copy 命令，
+    //     xterm 自己注册的 copy 事件处理器（负责写入 selectionText）因此不触发，
+    //     表现为“选中后 Ctrl+C 复制不了”。
+    //
+    // attachCustomKeyEventHandler 返回 false 会让 xterm 在执行任何 stopPropagation/
+    // preventDefault 之前提前退出，事件得以正常冒泡给全局处理器 / 浏览器原生行为。
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod) {
+        const key = (e.key || "").toLowerCase();
+        // Ctrl/Cmd+F：交给全局搜索
+        if (key === "f") return false;
+        // Ctrl/Cmd+C：有选区时交给浏览器原生复制（触发 xterm copyHandler 写选区）
+        if (key === "c" && term && term.hasSelection && term.hasSelection()) return false;
+        // Ctrl/Cmd+Shift+P：命令面板
+        if (key === "p" && e.shiftKey) return false;
+        return true;
+      }
+      // 无修饰键的全局快捷键（g/G/PgUp/PgDn/t/s//?等）：xterm 在【捕获阶段】对这些
+      // 键执行 cancel(stopPropagation+preventDefault)，会在事件冒泡到 document 的
+      // initShortcuts 之前截停它们。返回 false 让 xterm 提前退出、不取消事件，
+      // 从而冒泡给全局处理器。仅在"非输入"上下文生效（终端只读，其隐藏 textarea
+      // 不算 typing；真实输入框聚焦时不会走到这个 handler）。
+      if (isBareShortcutKey(e)) return false;
+      return true;
+    });
 
     // 行号栏：只读、无光标、不响应滚轮（由主终端滚动同步驱动）
     gutter = makeTerm({
       cursorBlink: false,
       cursorStyle: "bar",
-      scrollback: SCROLLBACK,
       theme: { background: "#181818", foreground: "#6a6a6a", cursor: "#6a6a6a" },
     });
     // 行号栏宽度固定（GUTTER_COLS），高度由主终端 fit 后用 gutter.resize 同步，
@@ -452,8 +590,8 @@
     (data.hosts || []).forEach((h) => {
       const opt = document.createElement("option");
       opt.value = h.name;
-      const plat = h.platform || "未知";
-      const status = h.online ? "" : "（离线）";
+      const plat = h.platform || t("unknown");
+      const status = h.online ? "" : t("offline");
       opt.textContent = h.name + " [" + plat + "]" + status;
       sel.appendChild(opt);
     });
@@ -488,8 +626,8 @@
       const existing = {};
       Array.from(sel.options).forEach((o) => { existing[o.value] = o; });
       hosts.forEach((h) => {
-        const plat = h.platform || "未知";
-        const status = h.online ? "" : "（离线）";
+        const plat = h.platform || t("unknown");
+        const status = h.online ? "" : t("offline");
         const text = h.name + " [" + plat + "]" + status;
         if (existing[h.name]) {
           existing[h.name].textContent = text;
@@ -530,9 +668,9 @@
       } else {
         await switchHost("local");
       }
-      toast("配置已重载（共 " + ((data.hosts || []).length) + " 台机器）", "success");
+      toast(t("toastConfigReloaded", { n: (data.hosts || []).length }), "success");
     } catch (e) {
-      toast("重载失败: " + e.message, "error");
+      toast(t("toastReloadFailed", { msg: e.message }), "error");
     }
   }
 
@@ -554,7 +692,7 @@
     enc.querySelectorAll('option[value="gbk"],option[value="gb2312"]').forEach((opt) => {
       opt.disabled = !currentCaps.hasIconv;
       const label = opt.value.toUpperCase();
-      opt.textContent = currentCaps.hasIconv ? label : label + "（远端缺少 iconv）";
+      opt.textContent = currentCaps.hasIconv ? label : label + t("encodingMissingIconv");
     });
     if (!currentCaps.hasIconv && (enc.value === "gbk" || enc.value === "gb2312")) {
       enc.value = "utf-8";
@@ -608,7 +746,7 @@
       applyCapabilities();
     } catch (e) {
       const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
-      if (!loginShown) toast("切换机器失败: " + e.message, "error");
+      if (!loginShown) toast(t("toastSwitchFailed", { msg: e.message }), "error");
     } finally {
       state.wsIntendedClose = false;
       connectWS();
@@ -722,8 +860,8 @@
     // 点击同一个文件无需提示。
     if ((state.running || state.stopping) && path !== $("filePath").value) {
       const follow = $("followTail").value === "true";
-      const verb = state.stopping ? "正在停止" : (follow ? "正在实时跟踪" : "正在读取");
-      if (!confirm("当前" + verb + "日志文件，切换前需要先停止。\n是否停止并切换到「" + name + "」？")) {
+      const verbKey = state.stopping ? "verbStopping" : (follow ? "verbFollow" : "verbStatic");
+      if (!confirm(t("confirmSwitchFile", { verb: t(verbKey), name }))) {
         return;
       }
       wsSend({ action: "stop" });
@@ -735,14 +873,16 @@
       resetTerminal();
       setConnStatus("online");
       updateButtons();
-      toast("已停止当前任务", "success");
+      toast(t("toastStoppedTask"), "success");
     }
     if (state.selectedNode) state.selectedNode.classList.remove("selected");
     item.classList.add("selected");
     state.selectedNode = item;
     state.currentFile = path;
     $("filePath").value = path;
-    toast("已选择文件: " + name, "success");
+    toast(t("toastFileSelected", { name }), "success");
+    // 移动端选完文件自动收起全屏侧栏。
+    try { document.dispatchEvent(new Event("fileSelected")); } catch (e) {}
   }
 
   function fmtSize(bytes) {
@@ -934,9 +1074,9 @@
           }),
         });
         const el = $("regexPreview");
-        const timePart = data.timeRange ? "时间: " + data.timeRange : "";
-        const rePart = data.pattern ? "正则: " + data.pattern : "";
-        el.textContent = [timePart, rePart].filter(Boolean).join("   |   ") || "(无过滤，读取全部)";
+        const timePart = data.timeRange ? t("previewTime") + data.timeRange : "";
+        const rePart = data.pattern ? t("previewRegex") + data.pattern : "";
+        el.textContent = [timePart, rePart].filter(Boolean).join("   |   ") || t("previewEmpty");
         // 正则校验错误：在预览区红字提示，并把对应输入框标红。
         const errEl = $("regexError");
         // 根据错误前缀定位到具体输入框（自定义正则优先级最高）。
@@ -956,7 +1096,7 @@
           errEl.style.display = "none";
         }
       } catch (e) {
-        $("regexPreview").textContent = "预览失败: " + e.message;
+        $("regexPreview").textContent = t("previewFailed") + e.message;
       }
     }, 150);
   }
@@ -976,7 +1116,7 @@
       // 停止中：立即给视觉反馈，不阻塞其它操作
       start.disabled = true;
       stop.disabled = false;
-      stop.textContent = "停止中...";
+      stop.textContent = t("stopping");
       stop.classList.add("loading");
       return;
     }
@@ -984,16 +1124,16 @@
     if (state.running) {
       start.disabled = true;
       stop.disabled = false;
-      stop.textContent = follow ? "停止跟踪" : "中断";
+      stop.textContent = follow ? t("stopFollow") : t("stopView");
     } else if (state.waiting) {
       // 等待目标文件产生：禁用"开始"避免重复提交，仍允许停止。
       start.disabled = true;
       stop.disabled = false;
-      stop.textContent = "取消等待";
+      stop.textContent = t("cancelWait");
     } else {
       start.disabled = !state.connected;
       stop.disabled = true;
-      start.textContent = follow ? "开始跟踪" : "开始查看";
+      start.textContent = follow ? t("startFollow") : t("startView");
     }
   }
 
@@ -1016,13 +1156,13 @@
     if (!name) return;
     const cfg = await api(hapi("/config/get?name=" + encodeURIComponent(name)));
     fillForm(cfg);
-    toast("已加载配置: " + name, "success");
+    toast(t("toastConfigLoaded", { name }), "success");
   }
 
   async function saveConfig(forceName) {
     const cfg = readForm();
     if (!cfg.ConfigName) {
-      const propose = forceName || cfg.ConfigName || prompt("请输入配置名称：");
+      const propose = forceName || cfg.ConfigName || prompt(t("promptConfigName"));
       if (!propose) return;
       cfg.ConfigName = propose;
     }
@@ -1033,7 +1173,7 @@
     });
     await loadConfigList();
     $("configSelect").value = cfg.ConfigName;
-    toast("配置已保存: " + cfg.ConfigName, "success");
+    toast(t("toastConfigSaved", { name: cfg.ConfigName }), "success");
   }
 
   // ============ WebSocket ============
@@ -1120,8 +1260,20 @@
         state.stopping = false;
         resetPauseState();
         setConnStatus("online");
-        toast("连接已恢复，继续跟踪日志", "success");
-        wsSend({ action: "start", filePath: resume.filePath, config: resume.config });
+        toast(t("connRecovered"), "success");
+        // 优先 attach 到服务端仍存活的 follow 会话（断线宽限期内），按 lastSeq
+        // 补发缺口日志；若会话已失效（attachSession 内部），由服务端回退到全新 start。
+        if (state.sessionID) {
+          wsSend({
+            action: "attach",
+            sessionID: state.sessionID,
+            lastSeq: state.lastSeq || 0,
+            filePath: resume.filePath,
+            config: resume.config,
+          });
+        } else {
+          wsSend({ action: "start", filePath: resume.filePath, config: resume.config });
+        }
       } else {
         setConnStatus(state.running ? "running" : "online");
       }
@@ -1134,7 +1286,10 @@
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === "log") {
+        // 记录服务端序号，断线重连时据此请求缺口补发。
+        if (typeof msg.seq === "number") state.lastSeq = msg.seq;
         writeToTerminal(msg.data, state.activeConfig ? state.activeConfig.HighlightRules : readForm().HighlightRules);
+        scheduleFab();
       } else if (msg.type === "reconnect") {
         // 服务器通知主机配置已热更：关闭当前连接，由 onclose 走重连流程
         // 绑定到新实例。reconnecting 标记抑制离线横幅，pendingResume 由
@@ -1142,20 +1297,36 @@
         state.reconnecting = true;
         try { state.ws.close(); } catch (e) {}
       } else if (msg.type === "error") {
-        if (term) term.write("\x1b[91m[错误] " + msg.msg + "\x1b[0m\r\n");
+        if (term) term.write("\x1b[91m" + t("termError") + msg.msg + "\x1b[0m\r\n");
         setConnStatus("online");
+      } else if (msg.type === "notice") {
+        // 日志轮转/截断/断线缺口等非错误事件：终端内写一行提示，同时显示可关闭通知条。
+        let key;
+        if (msg.kind === "truncate") key = "noticeTruncate";
+        else if (msg.kind === "gap") key = "noticeGap";
+        else key = "noticeRotate";
+        const text = t(key);
+        if (term) term.write("\x1b[33m" + text + "\x1b[0m\r\n");
+        showNotice(text);
       } else if (msg.type === "status") {
         if (msg.status === "running") {
           state.running = true; state.stopping = false; state.waiting = false;
+          // follow 会话返回 sessionID：断线重连据此 attach 补发缺口。
+          if (msg.sessionID) {
+            state.sessionID = msg.sessionID;
+            if (typeof msg.seq === "number") state.lastSeq = msg.seq;
+          }
           setConnStatus("running");
         } else if (msg.status === "stopped") {
           state.running = false; state.stopping = false; state.waiting = false;
           state.pendingResume = null;
+          state.sessionID = "";
+          state.lastSeq = 0;
           resetPauseState();
           setConnStatus("online");
         } else if (msg.status === "waiting") {
           state.waiting = true;
-          toast("等待日志文件产生...");
+          toast(t("toastWaiting"));
         }
         updateButtons();
       }
@@ -1202,7 +1373,7 @@
     };
     ws.onerror = () => {
       if (stale()) return;
-      if (term) term.write("\x1b[91m[连接错误] WebSocket 连接异常，正在尝试重连...\x1b[0m\r\n");
+      if (term) term.write("\x1b[91m" + t("wsReconnecting") + "\x1b[0m\r\n");
       ws.close();
     };
   }
@@ -1217,10 +1388,10 @@
 
   function startView() {
     const file = $("filePath").value.trim();
-    if (!file) { toast("请先在左侧选择日志文件", "error"); return; }
+    if (!file) { toast(t("toastChooseFileLeft"), "error"); return; }
     // 未连接时点开始：明确反馈并主动触发一次连接（不静默吞掉）。
     if (!state.connected) {
-      toast("正在连接服务器，请稍后重试", "error");
+      toast(t("toastConnecting"), "error");
       cancelReconnect();
       reconnectDelay = RECONNECT_BASE;
       connectWS();
@@ -1274,7 +1445,7 @@
     $("exportTitle").textContent = title;
     $("progressFill").style.width = "0%";
     $("exportPercent").textContent = "0%";
-    $("exportStatus").textContent = "连接中...";
+    $("exportStatus").textContent = t("exportConnecting");
     $("exportMask").classList.add("show");
     $("exportRawBtn").disabled = true;
     $("exportFilterBtn").disabled = true;
@@ -1283,17 +1454,17 @@
     if (exportAbort) {
       try { exportAbort.abort(); } catch (e) {}
     }
-    $("exportStatus").textContent = "正在取消...";
+    $("exportStatus").textContent = t("exportCanceling");
   }
   function setExportProgress(received, total, done) {
     let pct;
     if (total && total > 0) {
       pct = Math.min(100, Math.round((received / total) * 100));
-      $("exportStatus").textContent = done ? "完成" : (fmtBytes(received) + " / " + fmtBytes(total));
+      $("exportStatus").textContent = done ? t("exportDone") : (fmtBytes(received) + " / " + fmtBytes(total));
     } else {
       // 无 Content-Length（过滤导出通常如此）：不确定进度，用已接收字节做提示
       pct = done ? 100 : 0;
-      $("exportStatus").textContent = done ? "完成" : ("已生成 " + fmtBytes(received) + " ...");
+      $("exportStatus").textContent = done ? t("exportDone") : (t("exportGenerating") + fmtBytes(received) + " ...");
     }
     $("progressFill").style.width = pct + "%";
     $("exportPercent").textContent = pct + "%";
@@ -1310,7 +1481,7 @@
   function authCheck(r) {
     if (r.status === 401 && authEnabled) {
       showLogin();
-      throw new Error("未登录或会话已过期");
+      throw new Error(t("toastSessionExpired"));
     }
     return r;
   }
@@ -1354,23 +1525,23 @@
 
   // 导出原始：GET 流式下载 + 进度（原始文件有 Content-Length，可显示真实进度）
   async function triggerRawDownload(file) {
-    showExport("正在导出原始日志...");
+    showExport(t("exportingRaw"));
     try {
       const r = authCheck(await fetch(hapi("/file/download/origin?path=" + encodeURIComponent(file)),
         { signal: exportAbort.signal }));
       if (!r.ok) {
-        let msg = "导出失败 " + r.status;
+        let msg = t("exportFailedCode") + r.status;
         try { msg = (await r.json()).error || msg; } catch (e) {}
         throw new Error(msg);
       }
       const blob = await streamDownload(r, exportAbort.signal);
       saveBlob(r, blob);
       setTimeout(hideExport, 400);
-      toast("原始日志已导出", "success");
+      toast(t("exportRawDone"), "success");
     } catch (e) {
-      if (e.name === "AbortError") { hideExport(); toast("已取消导出", ""); return; }
+      if (e.name === "AbortError") { hideExport(); toast(t("exportCanceled"), ""); return; }
       hideExport();
-      toast("导出失败: " + e.message, "error");
+      toast(t("exportFailed", { msg: e.message }), "error");
     }
   }
 
@@ -1378,7 +1549,7 @@
   // 处理中禁用按钮，完成后恢复。
   async function triggerFilteredDownload(file) {
     if (exporting) return;
-    showExport("正在按过滤条件导出（大文件可能需要一些时间）...");
+    showExport(t("exportingFilter"));
     try {
       const r = authCheck(await fetch(
         hapi("/file/download/filter?path=" + encodeURIComponent(file)),
@@ -1390,19 +1561,382 @@
         }
       ));
       if (!r.ok) {
-        let msg = "导出失败 " + r.status;
+        let msg = t("exportFailedCode") + r.status;
         try { msg = (await r.json()).error || msg; } catch (e) {}
         throw new Error(msg);
       }
       const blob = await streamDownload(r, exportAbort.signal);
       saveBlob(r, blob);
       setTimeout(hideExport, 400);
-      toast("过滤日志已导出", "success");
+      toast(t("exportFilterDone"), "success");
     } catch (e) {
-      if (e.name === "AbortError") { hideExport(); toast("已取消导出", ""); return; }
+      if (e.name === "AbortError") { hideExport(); toast(t("exportCanceled"), ""); return; }
       hideExport();
-      toast("导出失败: " + e.message, "error");
+      toast(t("exportFailed", { msg: e.message }), "error");
     }
+  }
+
+  // ============ 悬浮滚动按钮 / 通知条 ============
+  // FAB 显隐由主终端滚动位置驱动：顶部隐藏"到顶部"，底部隐藏"到底部"，
+  // 中间两者都显示（符合用户预期，且"到底部"在跟踪态上滚时同时充当"继续跟踪"）。
+  let fabRaf = 0;
+  function updateFab() {
+    const fab = $("scrollFab");
+    if (!fab || !term) return;
+    const buf = term.buffer.active;
+    const top = buf.viewportY;
+    const bottom = buf.baseY + buf.length - term.rows;
+    const showTop = top > 0;
+    const showBottom = top < bottom - 1;
+    if (!showTop && !showBottom) { fab.style.display = "none"; return; }
+    fab.style.display = "flex";
+    $("fabTop").style.display = showTop ? "" : "none";
+    $("fabBottom").style.display = showBottom ? "" : "none";
+  }
+  function scheduleFab() {
+    if (fabRaf) return;
+    fabRaf = requestAnimationFrame(() => { fabRaf = 0; updateFab(); });
+  }
+  function scrollTop() { if (term) { term.scrollToTop(); scheduleFab(); } }
+  function scrollBottom() { if (term) { term.scrollToBottom(); scheduleFab(); } }
+
+  // 通知条：日志轮转/截断等非错误事件，显示在终端工具栏上方，可手动关闭。
+  function showNotice(text) {
+    const bar = $("noticeBar");
+    if (!bar) return;
+    $("noticeText").textContent = text;
+    bar.style.display = "flex";
+  }
+  function hideNotice() {
+    const bar = $("noticeBar");
+    if (bar) bar.style.display = "none";
+  }
+
+  // ============ 焦点判定与全局快捷键 ============
+  // 输入框/文本域/下拉/contentEditable 内按键时保留浏览器原生行为（输入、复制、
+  // 查找等），不触发全局单键快捷键；仅 Ctrl/Cmd 组合与 Esc 放行给对应处理器。
+  function isTyping() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "SELECT") return true;
+    if (tag === "TEXTAREA") {
+      // xterm 的隐藏 textarea（.xterm-helper-textarea）在终端聚焦时持有焦点，
+      // 但它是 disableStdin 的只读辅助元素，不接收真实文本输入。不能把它当作
+      // "正在输入"，否则 g/G/PgUp/PgDn 等快捷键会被守卫误拦、全部失效。
+      if (el.classList && el.classList.contains("xterm-helper-textarea")) return false;
+      return true;
+    }
+    if (el.isContentEditable) return true;
+    return false;
+  }
+  function openSearch() {
+    // 复用 initTerminalSearch 暴露的 open()（挂在模块级 searchOpen）。
+    if (typeof searchOpen === "function") searchOpen();
+  }
+  function toggleFollowMode() {
+    const sel = $("followTail");
+    sel.value = sel.value === "true" ? "false" : "true";
+    sel.dispatchEvent(new Event("change"));
+  }
+  function toggleStartStop() {
+    if (state.running || state.stopping) { stopView(); }
+    else { startView(); }
+    updateButtons();
+  }
+  function cycleTheme() {
+    // 三态循环：auto -> light -> dark -> auto。按钮点击的便捷入口。
+    const order = ["auto", "light", "dark"];
+    const next = order[(order.indexOf(prefs.themeMode) + 1) % order.length];
+    setThemeMode(next);
+    const label = next === "auto" ? t("settingThemeAuto")
+      : next === "light" ? t("settingThemeLight") : t("settingThemeDark");
+    toast(label);
+  }
+  // isBareShortcutKey 判断一个无 Ctrl/Cmd/Meta 修饰的 keydown 是否属于全局快捷键。
+  // 供 xterm 的 attachCustomKeyEventHandler 使用：仅对这些键返回 false 放行，
+  // 其余键（方向键、Home/End 等）仍交 xterm 处理，避免越权篡改终端行为。
+  function isBareShortcutKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    switch (e.key) {
+      case "/": case "?":
+      case "t": case "T":
+      case "s": case "S":
+      case "g": case "G":
+      case "PageUp": case "PageDown":
+      case "[": case "]":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  function initShortcuts() {
+    document.addEventListener("keydown", (e) => {
+      // Ctrl/Cmd 组合：除 Ctrl+Shift+P（命令面板）与 Ctrl+F（搜索）外，一律交给
+      // 浏览器/各控件原生处理，避免吞掉复制、粘贴、全选、刷新等。
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod) {
+        const key = (e.key || "").toLowerCase();
+        if (key === "f") { e.preventDefault(); openSearch(); return; }
+        if (key === "p" && e.shiftKey) { e.preventDefault(); openPalette(); return; }
+        return;
+      }
+      // Esc 关闭最上层浮层（任何焦点下都生效）。
+      if (e.key === "Escape") {
+        if (closeTopOverlay()) return;
+        return;
+      }
+      if (isTyping()) return;
+
+      let handled = true;
+      switch (e.key) {
+        case "/": openSearch(); break;
+        case "t": case "T": toggleFollowMode(); break;
+        case "s": case "S": toggleStartStop(); break;
+        case "g": scrollTop(); break;
+        case "G": scrollBottom(); break;
+        case "PageUp": if (term) term.scrollPages(-1); scheduleFab(); break;
+        case "PageDown": if (term) term.scrollPages(1); scheduleFab(); break;
+        case "?": openOverlay("shortcutsHelp"); break;
+        case "[": case "]": /* 标签页功能预留 */ break;
+        default: handled = false;
+      }
+      if (handled) e.preventDefault();
+    });
+  }
+
+  // ============ 浮层管理 ============
+  const OVERLAY_IDS = ["shortcutsHelp", "commandPalette", "settingsDrawer"];
+  function isOverlayOpen(id) {
+    const el = $(id);
+    return !!(el && el.classList.contains("show"));
+  }
+  function openOverlay(id) {
+    // 同一时刻只显示一个浮层；打开命令面板/帮助前关闭其它。
+    OVERLAY_IDS.forEach((x) => { if (x !== id) $(x).classList.remove("show"); });
+    $(id).classList.add("show");
+  }
+  function closeOverlay(id) { $(id).classList.remove("show"); }
+  function closeTopOverlay() {
+    for (const id of OVERLAY_IDS) {
+      if (isOverlayOpen(id)) { closeOverlay(id); return true; }
+    }
+    return false;
+  }
+  function bindOverlayClose(id) {
+    const mask = $(id);
+    const closeBtn = mask.querySelector(".overlay-close");
+    if (closeBtn) closeBtn.addEventListener("click", () => closeOverlay(id));
+    // 点击遮罩空白处关闭
+    mask.addEventListener("mousedown", (e) => {
+      if (e.target === mask) closeOverlay(id);
+    });
+  }
+
+  // ============ 命令面板 ============
+  // 命令注册表：title 用于展示与模糊匹配，run 执行动作。
+  let commands = [];
+  let paletteIndex = 0;
+  let paletteFiltered = [];
+  function fuzzyScore(query, text) {
+    // 子序列匹配：query 的每个字符按序出现在 text 中得分；连续/开头命中加权。
+    if (!query) return 1;
+    const q = query.toLowerCase();
+    const s = text.toLowerCase();
+    let qi = 0, score = 0, streak = 0, prevIdx = -1;
+    for (let i = 0; i < s.length && qi < q.length; i++) {
+      if (s[i] === q[qi]) {
+        streak = (prevIdx === i - 1) ? streak + 1 : 1;
+        score += 1 + streak;
+        if (i === 0) score += 2;
+        prevIdx = i;
+        qi++;
+      }
+    }
+    return qi === q.length ? score : 0;
+  }
+  function renderPalette() {
+    const list = $("paletteList");
+    const q = $("paletteInput").value.trim();
+    paletteFiltered = commands
+      .map((c) => ({ c, score: fuzzyScore(q, c.title) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.c);
+    if (paletteIndex >= paletteFiltered.length) paletteIndex = 0;
+    list.innerHTML = "";
+    if (!paletteFiltered.length) {
+      const li = document.createElement("li");
+      li.className = "palette-empty";
+      li.textContent = t("paletteEmpty");
+      list.appendChild(li);
+      return;
+    }
+    paletteFiltered.forEach((c, i) => {
+      const li = document.createElement("li");
+      li.textContent = c.title;
+      if (i === paletteIndex) li.className = "active";
+      li.addEventListener("mousedown", (e) => { e.preventDefault(); paletteIndex = i; runPalette(); });
+      li.addEventListener("mouseenter", () => {
+        paletteIndex = i;
+        list.querySelectorAll("li").forEach((el, j) => el.classList.toggle("active", j === i));
+      });
+      list.appendChild(li);
+    });
+  }
+  function runPalette() {
+    const c = paletteFiltered[paletteIndex];
+    if (!c) return;
+    closeOverlay("commandPalette");
+    try { c.run(); } catch (e) { toast(t("toastInitFailed", { msg: e.message }), "error"); }
+  }
+  function openPalette() {
+    openOverlay("commandPalette");
+    paletteIndex = 0;
+    const input = $("paletteInput");
+    input.value = "";
+    renderPalette();
+    setTimeout(() => input.focus(), 0);
+  }
+  function initPalette() {
+    const input = $("paletteInput");
+    input.addEventListener("input", () => { paletteIndex = 0; renderPalette(); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (paletteFiltered.length) paletteIndex = (paletteIndex + 1) % paletteFiltered.length;
+        renderPalette();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (paletteFiltered.length) paletteIndex = (paletteIndex - 1 + paletteFiltered.length) % paletteFiltered.length;
+        renderPalette();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        runPalette();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeOverlay("commandPalette");
+      }
+    });
+  }
+  function buildCommands() {
+    commands = [
+      { id: "start", title: t("cmdStart"), run: toggleStartStop },
+      { id: "clear", title: t("cmdClear"), run: () => resetTerminal() },
+      { id: "copy", title: t("cmdCopy"), run: () => $("copyBtn").click() },
+      { id: "exportRaw", title: t("cmdExportRaw"), run: () => $("exportRawBtn").click() },
+      { id: "exportFilter", title: t("cmdExportFilter"), run: () => $("exportFilterBtn").click() },
+      { id: "theme", title: t("cmdToggleTheme"), run: cycleTheme },
+      { id: "follow", title: t("cmdToggleFollow"), run: toggleFollowMode },
+      { id: "top", title: t("cmdTop"), run: scrollTop },
+      { id: "bottom", title: t("cmdBottom"), run: scrollBottom },
+      { id: "reload", title: t("cmdReload"), run: safeRun(reloadConfig) },
+      { id: "shortcuts", title: t("cmdShortcuts"), run: () => openOverlay("shortcutsHelp") },
+      { id: "settings", title: t("cmdSettings"), run: openSettings },
+      { id: "lang", title: t("cmdLanguage"), run: () => setLang(prefs.lang === "en" ? "zh" : "en") },
+    ];
+  }
+
+  // ============ 设置抽屉 ============
+  function updateThemeSeg() {
+    const seg = $("themeSeg");
+    if (!seg) return;
+    seg.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-theme") === prefs.themeMode);
+    });
+  }
+  function updateLangSeg() {
+    const seg = $("langSeg");
+    if (!seg) return;
+    const lang = window.I18N.lang || detectLang();
+    seg.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-lang") === lang);
+    });
+    const sel = $("langSelect");
+    if (sel) sel.value = lang;
+  }
+  function updateDensitySeg() {
+    const seg = $("densitySeg");
+    if (!seg) return;
+    seg.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-density") === prefs.density);
+    });
+  }
+  function setLang(lang) {
+    if (lang !== "zh" && lang !== "en") lang = detectLang();
+    prefs = savePrefs({ lang: lang });
+    applyI18n();
+    updateLangSeg();
+    // 语言切换后，命令标题、按钮文案等动态文本需要重建。
+    buildCommands();
+    updateButtons();
+    const pb = $("pauseBtn");
+    if (pb) pb.textContent = state.paused ? t("resume") : t("pause");
+  }
+  function openSettings() {
+    openOverlay("settingsDrawer");
+    $("fontSizeRange").value = fontSize();
+    $("lineHeightRange").value = lineHeight();
+    $("fontSizeVal").textContent = fontSize();
+    $("lineHeightVal").textContent = Number(lineHeight()).toFixed(2);
+    $("scrollbackSelect").value = String(scrollback());
+    updateThemeSeg();
+    updateLangSeg();
+    updateDensitySeg();
+  }
+  function initSettings() {
+    $("themeSeg").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-theme]");
+      if (btn) setThemeMode(btn.getAttribute("data-theme"));
+    });
+    $("langSeg").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-lang]");
+      if (btn) setLang(btn.getAttribute("data-lang"));
+    });
+    $("densitySeg").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-density]");
+      if (!btn) return;
+      prefs = savePrefs({ density: btn.getAttribute("data-density") });
+      updateDensitySeg();
+      applyTerminalPrefs();
+    });
+    const fsRange = $("fontSizeRange");
+    fsRange.addEventListener("input", () => {
+      const v = parseInt(fsRange.value, 10);
+      $("fontSizeVal").textContent = v;
+      prefs = savePrefs({ fontSize: v });
+      applyTerminalPrefs();
+    });
+    const lhRange = $("lineHeightRange");
+    lhRange.addEventListener("input", () => {
+      const v = parseFloat(lhRange.value);
+      $("lineHeightVal").textContent = v.toFixed(2);
+      prefs = savePrefs({ lineHeight: v });
+      applyTerminalPrefs();
+    });
+    // xterm 无法在运行中改 scrollback（只能在构造时设定）。保存并提示下次生效，
+    // 不偷偷重建终端以免打断正在跟踪的日志。
+    $("scrollbackSelect").addEventListener("change", (e) => {
+      prefs = savePrefs({ scrollback: parseInt(e.target.value, 10) });
+      toast(t("toastScrollbackHint"));
+    });
+  }
+
+  // ============ 移动端 ============
+  function initMobile() {
+    const hamburger = $("hamburgerBtn");
+    const panel = $("treePanel");
+    if (!hamburger || !panel) return;
+    hamburger.addEventListener("click", () => {
+      panel.classList.toggle("mobile-open");
+    });
+    // 选中文件/目录后自动收起移动端侧栏
+    document.addEventListener("fileSelected", () => {
+      if (window.matchMedia && window.matchMedia("(max-width: 768px)").matches) {
+        panel.classList.remove("mobile-open");
+      }
+    });
   }
 
   // ============ 事件绑定 ============
@@ -1414,7 +1948,7 @@
       await refreshHosts();
       const root = $("rootSelect").value;
       if (root) await loadTreeDir(root, treeEl);
-      toast("已刷新", "success");
+      toast(t("toastRefreshed"), "success");
     }));
     $("reloadCfgBtn").addEventListener("click", safeRun(reloadConfig));
     $("reconnectBtn").addEventListener("click", () => {
@@ -1430,19 +1964,19 @@
     $("loadCfgBtn").addEventListener("click", safeRun(loadSelectedConfig));
     $("saveCfgBtn").addEventListener("click", safeRun(() => saveConfig($("cfgName").value)));
     $("saveAsCfgBtn").addEventListener("click", safeRun(() => {
-      const name = prompt("另存为配置名称：");
+      const name = prompt(t("promptSaveAsName"));
       if (name) { $("cfgName").value = name; return saveConfig(name); }
     }));
     $("delCfgBtn").addEventListener("click", safeRun(async () => {
       const name = $("configSelect").value;
       if (!name) return;
-      if (!confirm("删除配置「" + name + "」？")) return;
+      if (!confirm(t("confirmDeleteCfg", { name }))) return;
       await api(hapi("/config/delete"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
       await loadConfigList();
-      toast("已删除", "success");
+      toast(t("toastDeleted"), "success");
     }));
     $("setDefaultCfgBtn").addEventListener("click", safeRun(async () => {
       const name = $("configSelect").value;
@@ -1451,12 +1985,12 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
-      toast("已设为默认", "success");
+      toast(t("toastSetDefault"), "success");
     }));
     $("renameCfgBtn").addEventListener("click", safeRun(async () => {
       const oldName = $("configSelect").value;
       if (!oldName) return;
-      const newName = prompt("将配置「" + oldName + "」重命名为：", oldName);
+      const newName = prompt(t("promptRename", { old: oldName }), oldName);
       if (!newName || newName.trim() === "" || newName === oldName) return;
       await api(hapi("/config/rename"), {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -1464,7 +1998,7 @@
       });
       $("cfgName").value = newName.trim();
       await loadConfigList();
-      toast("已重命名", "success");
+      toast(t("toastRenamed"), "success");
     }));
 
     $("startBtn").addEventListener("click", () => { startView(); updateButtons(); });
@@ -1476,7 +2010,7 @@
         wsSend({ action: "stop" });
         state.running = false;
         setConnStatus("online");
-        toast("已停止当前任务，可重新开始", "success");
+        toast(t("toastTaskStoppedRestart"), "success");
       }
       updateButtons();
     });
@@ -1487,8 +2021,8 @@
       const panel = $("configPanel");
       panel.classList.toggle("collapsed");
       const collapsed = panel.classList.contains("collapsed");
-      $("cfgToggle").innerHTML = collapsed ? "▸ 展开配置" : "▾ 收起配置";
-      $("cfgToggle").title = collapsed ? "展开配置" : "折叠配置";
+      $("cfgToggle").textContent = collapsed ? t("cfgExpand") : t("cfgCollapse");
+      $("cfgToggle").title = collapsed ? t("cfgExpandTitle") : t("cfgCollapseTitle");
       setTimeout(fitTerm, 60);
     };
     $("cfgToggle").addEventListener("click", togglePanel);
@@ -1511,16 +2045,12 @@
         panel.style.width = rememberedWidth || "";
       }
       $("sidebarReopen").classList.toggle("show", collapsed);
-      $("sidebarCollapse").textContent = collapsed ? "▶ 展开" : "◀ 收起";
+      $("sidebarCollapse").textContent = collapsed ? t("expandSidebar") : t("collapseSidebar");
       setTimeout(fitTerm, 80);
     };
-    $("sidebarCollapse").addEventListener("click", () => setSidebar(true));
+    const sidebarCollapseBtn = $("sidebarCollapse");
+    sidebarCollapseBtn.addEventListener("click", () => setSidebar(true));
     $("sidebarReopen").querySelector("button").addEventListener("click", () => setSidebar(false));
-
-    // 主题切换（白天/黑夜）
-    $("themeToggle").addEventListener("click", () => {
-      applyTheme(currentTheme() === "dark" ? "light" : "dark");
-    });
 
     // 时间粒度切换：重建 flatpickr
     $("timePrecision").addEventListener("change", () => {
@@ -1542,11 +2072,11 @@
 
     $("pauseBtn").addEventListener("click", () => {
       state.paused = !state.paused;
-      $("pauseBtn").textContent = state.paused ? "继续" : "暂停";
+      $("pauseBtn").textContent = state.paused ? t("resume") : t("pause");
       if (!state.paused) {
         if (state.pausedDropped > 0) {
           const approxLines = Math.round(state.pausedDropped / 120);
-          if (term) term.write("\x1b[33m[提示] 暂停期间缓冲已达上限，丢弃了约 " + approxLines + " 行较早的日志\x1b[0m\r\n");
+          if (term) term.write("\x1b[33m" + t("toastPausedDropped", { n: approxLines }) + "\x1b[0m\r\n");
         }
         if (state.pausedBuffer.length) {
           const rules = readForm().HighlightRules;
@@ -1563,11 +2093,11 @@
     });
     $("copyBtn").addEventListener("click", safeRun(() => {
       const sel = term.getSelection();
-      if (!sel) { toast("请先在终端中鼠标选中文本", "error"); return; }
+      if (!sel) { toast(t("toastNoSelection"), "error"); return; }
       // navigator.clipboard 仅在安全上下文（HTTPS/localhost）下存在；
       // 非安全 HTTP 访问时为 undefined，直接调用会抛错。用 textarea 兜底。
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        return navigator.clipboard.writeText(sel).then(() => toast("已复制", "success"));
+        return navigator.clipboard.writeText(sel).then(() => toast(t("toastCopied"), "success"));
       }
       const ta = document.createElement("textarea");
       ta.value = sel;
@@ -1575,20 +2105,45 @@
       ta.style.opacity = "0";
       document.body.appendChild(ta);
       ta.select();
-      try { document.execCommand("copy"); toast("已复制", "success"); }
+      try { document.execCommand("copy"); toast(t("toastCopied"), "success"); }
       finally { ta.remove(); }
     }));
     $("exportRawBtn").addEventListener("click", () => {
       const file = $("filePath").value.trim();
-      if (!file) { toast("请先选择日志文件", "error"); return; }
+      if (!file) { toast(t("toastChooseFile"), "error"); return; }
       triggerRawDownload(file);
     });
     $("exportFilterBtn").addEventListener("click", () => {
       const file = $("filePath").value.trim();
-      if (!file) { toast("请先选择日志文件", "error"); return; }
+      if (!file) { toast(t("toastChooseFile"), "error"); return; }
       triggerFilteredDownload(file);
     });
     $("exportCancelBtn").addEventListener("click", cancelExport);
+
+    // 悬浮滚动按钮
+    $("fabTop").addEventListener("click", scrollTop);
+    $("fabBottom").addEventListener("click", scrollBottom);
+    $("noticeClose").addEventListener("click", hideNotice);
+
+    // 顶栏：主题三态循环、设置抽屉、语言下拉
+    $("themeToggle").addEventListener("click", cycleTheme);
+    $("settingsBtn").addEventListener("click", openSettings);
+    // 右上角两组独立弹窗：帮助（快捷键面板）、控制面板（命令面板）。
+    // 二者经 openOverlay 互斥但各自独立打开/关闭，状态互不干扰。
+    const helpBtn = $("helpBtn");
+    if (helpBtn) helpBtn.addEventListener("click", () => openOverlay("shortcutsHelp"));
+    const controlPanelBtn = $("controlPanelBtn");
+    if (controlPanelBtn) controlPanelBtn.addEventListener("click", openPalette);
+    $("langSelect").addEventListener("change", (e) => setLang(e.target.value));
+
+    // 浮层关闭
+    bindOverlayClose("shortcutsHelp");
+    bindOverlayClose("commandPalette");
+    bindOverlayClose("settingsDrawer");
+    initPalette();
+    initSettings();
+    initMobile();
+    buildCommands();
 
     initTerminalSearch();
 
@@ -1598,6 +2153,11 @@
     $("logoutBtn").addEventListener("click", onLogout);
 
     initSplitter();
+    initShortcuts();
+
+    // 滚动同步 FAB 显隐
+    if (term) term.onScroll(scheduleFab);
+    window.addEventListener("resize", scheduleFab);
   }
 
   // ============ 终端内搜索 ============
@@ -1625,28 +2185,66 @@
       };
     }
 
-    function showFound(found) {
-      count.textContent = found ? "" : "无匹配";
-      count.className = "search-count" + (found ? "" : " none");
+    // 当前查询对应的匹配总数（来自 addon 的 onDidChangeResults 事件，含已装饰匹配数）。
+    // resultIndex 为当前选中项的 0 基下标；-1 表示无选中。
+    let currentResultCount = 0;
+    let currentResultIndex = -1;
+
+    function renderCount() {
+      if (!input.value) {
+        count.textContent = "";
+        count.className = "search-count";
+        return;
+      }
+      if (currentResultCount === 0) {
+        count.textContent = t("searchNoMatch");
+        count.className = "search-count none";
+        return;
+      }
+      // 达到装饰上限时总数可能更多，如实标注 "N+"。
+      const total = currentResultCount >= searchResultLimit
+        ? currentResultCount + "+"
+        : String(currentResultCount);
+      const pos = currentResultIndex >= 0 ? (currentResultIndex + 1) : 0;
+      count.textContent = t("searchCount", { pos, total });
+      count.className = "search-count";
+    }
+
+    // 订阅 addon 的官方结果事件：每次 findNext/findPrevious 后回传
+    // {resultIndex, resultCount}，是显示【当前/总数】的权威数据源，不靠返回值猜测。
+    if (searchAddon.onDidChangeResults) {
+      searchAddon.onDidChangeResults((r) => {
+        currentResultCount = r.resultCount || 0;
+        currentResultIndex = typeof r.resultIndex === "number" ? r.resultIndex : -1;
+        renderCount();
+      });
     }
 
     function doFind(forward) {
       const q = input.value;
-      if (!q) { count.textContent = ""; return; }
+      if (!q) { currentResultCount = 0; currentResultIndex = -1; renderCount(); return; }
       // 查询变化时从头开始，避免从旧光标位置漏掉上方匹配
       if (q !== lastQuery) {
         searchAddon.clearDecorations?.();
         term.clearSelection();
         lastQuery = q;
+        currentResultCount = 0;
+        currentResultIndex = -1;
       }
-      let found = false;
       try {
-        found = forward ? searchAddon.findNext(q, opts()) : searchAddon.findPrevious(q, opts());
+        const found = forward ? searchAddon.findNext(q, opts()) : searchAddon.findPrevious(q, opts());
+        // 事件通常已携带结果；若 addon 版本未触发事件，用返回值兜底。
+        if (!searchAddon.onDidChangeResults) {
+          currentResultCount = found ? 1 : 0;
+          currentResultIndex = found ? 0 : -1;
+          renderCount();
+        }
       } catch (e) {
         // 非法正则（若启用 regex）等
-        found = false;
+        currentResultCount = 0;
+        currentResultIndex = -1;
+        renderCount();
       }
-      showFound(found);
     }
 
     function open() {
@@ -1656,8 +2254,14 @@
       input.focus();
       input.select();
       lastQuery = "";
+      currentResultCount = 0;
+      currentResultIndex = -1;
+      // 打开时不立即显示"无匹配"，等用户按 Enter/上下钮触发查找后再出结果。
       count.textContent = "";
+      count.className = "search-count";
     }
+    // 暴露给全局快捷键模块（initShortcuts 统一处理 Ctrl+F 与 /）。
+    searchOpen = open;
 
     function close() {
       bar.style.display = "none";
@@ -1669,23 +2273,19 @@
       if (e.key === "Enter") { e.preventDefault(); doFind(!e.shiftKey); }
       else if (e.key === "Escape") { e.preventDefault(); close(); }
     });
-    // 输入变化时重置起点状态
-    input.addEventListener("input", () => { lastQuery = ""; count.textContent = ""; });
+    // 输入变化时重置起点状态；尚未执行查找前不显示"无匹配/计数"。
+    input.addEventListener("input", () => {
+      lastQuery = "";
+      currentResultCount = 0;
+      currentResultIndex = -1;
+      count.textContent = "";
+      count.className = "search-count";
+    });
     caseBtn.addEventListener("change", () => { lastQuery = ""; doFind(true); });
 
     $("searchNext").addEventListener("click", () => doFind(true));
     $("searchPrev").addEventListener("click", () => doFind(false));
     $("searchClose").addEventListener("click", close);
-
-    // 全局 Ctrl+F / Cmd+F 唤起搜索
-    document.addEventListener("keydown", (e) => {
-      if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
-        e.preventDefault();
-        open();
-      } else if (e.key === "Escape" && bar.style.display !== "none" && document.activeElement === input) {
-        close();
-      }
-    });
   }
 
   // ============ 拖拽侧栏 ============
@@ -1745,7 +2345,7 @@
     errEl.textContent = "";
     const username = $("loginUser").value.trim();
     const password = $("loginPass").value;
-    if (!username || !password) { errEl.textContent = "请输入用户名和密码"; return; }
+    if (!username || !password) { errEl.textContent = t("userPassRequired"); return; }
     try {
       const r = await fetch("/api/login", {
         method: "POST",
@@ -1755,7 +2355,7 @@
       const data = r.headers.get("content-type")?.includes("json")
         ? await r.json().catch(() => ({})) : {};
       if (!r.ok) {
-        errEl.textContent = data.error || ("登录失败 " + r.status);
+        errEl.textContent = data.error || (t("loginFailed") + r.status);
         $("loginPass").value = "";
         return;
       }
@@ -1763,7 +2363,7 @@
       state.wsIntendedClose = false;
       await init();
     } catch (err) {
-      errEl.textContent = "网络错误: " + err.message;
+      errEl.textContent = t("netError") + err.message;
     }
   }
 
@@ -1780,9 +2380,12 @@
   function setupUI() {
     if (uiReady) return;
     uiReady = true;
-    let saved = "dark";
-    try { saved = localStorage.getItem("logviewer-theme") || "dark"; } catch (e) {}
-    applyTheme(saved);
+    applyI18n();
+    applyTheme();
+    // 初始化各设置分段控件的高亮态。
+    updateThemeSeg();
+    updateLangSeg();
+    updateDensitySeg();
     initFp();
     // flatpickr 变化时刷新预览
     fpStart.config.onChange.push(refreshPreview);
@@ -1825,7 +2428,7 @@
     } catch (e) {
       // 401 已由 api() 弹出登录遮罩，这里不再重复 toast
       const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
-      if (!loginShown) toast("初始化失败: " + e.message, "error");
+      if (!loginShown) toast(t("toastInitFailed", { msg: e.message }), "error");
       return;
     }
     updateButtons();

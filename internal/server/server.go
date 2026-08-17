@@ -13,6 +13,7 @@ import (
 
 	"logviewer/internal/appconfig"
 	"logviewer/internal/host"
+	"logviewer/internal/metrics"
 	"logviewer/internal/procmgr"
 )
 
@@ -22,6 +23,8 @@ type Options struct {
 	Static     fs.FS
 	Auth       appconfig.AuthConfig
 	ConfigPath string
+	// SessionGrace 是 follow 模式下 WS 断线后会话保留的宽限时长（断线补齐）。
+	SessionGrace time.Duration
 	// ReloadFunc 热加载配置：返回新配置、本次被替换/移除的主机别名列表、错误。
 	// 返回的 changed 别名用于通知这些主机上的活跃 WS 连接重连到新实例。
 	ReloadFunc func() (cfg *appconfig.AppConfig, changedHosts []string, err error)
@@ -42,19 +45,27 @@ type Server struct {
 	// 通知对应连接重连（拿到新 Host 实例）。
 	wsMu      sync.Mutex
 	wsClients map[*wsClient]string
+
+	// sessions 管理 follow 会话与 WS 连接的解耦（断线宽限 + 环形缓冲补齐）。
+	sessions *sessionRegistry
+	// sessionGrace 断线后会话保留宽限。
+	sessionGrace time.Duration
 }
 
 // New 创建 Server。
 func New(opts Options) *Server {
-	return &Server{
-		hosts:      opts.Hosts,
-		procs:      procmgr.NewManager(),
-		static:     opts.Static,
-		auth:       newAuthService(opts.Auth),
-		configPath: opts.ConfigPath,
-		reloadFn:   opts.ReloadFunc,
-		wsClients:  map[*wsClient]string{},
+	srv := &Server{
+		hosts:        opts.Hosts,
+		procs:        procmgr.NewManager(),
+		static:       opts.Static,
+		auth:         newAuthService(opts.Auth),
+		configPath:   opts.ConfigPath,
+		reloadFn:     opts.ReloadFunc,
+		wsClients:    map[*wsClient]string{},
+		sessionGrace: opts.SessionGrace,
 	}
+	srv.sessions = newSessionRegistry(srv)
+	return srv
 }
 
 // registerClient 记录一个 WS 连接与其绑定的主机别名。
@@ -102,6 +113,10 @@ func (s *Server) NotifyHostsChanged(changed []string) int {
 // Auth 暴露认证服务（供 main 打印启用状态）。
 func (s *Server) Auth() *authService { return s.auth }
 
+// refreshProcMetric 把当前正在运行的日志进程数同步到 Prometheus 指标。
+// 在进程启动成功、进程退出、停止会话等状态变化点调用。
+func (s *Server) refreshProcMetric() { metrics.SetProcesses(s.procs.Count()) }
+
 // UpdateAuth 热更新认证配置（reload 后调用）。若认证开关状态或用户名变化，清空所有现有会话。
 func (s *Server) UpdateAuth(cfg appconfig.AuthConfig) {
 	s.auth.mu.Lock()
@@ -116,9 +131,18 @@ func (s *Server) UpdateAuth(cfg appconfig.AuthConfig) {
 	s.auth.mu.Unlock()
 }
 
-// Close 释放后端资源：先停掉所有正在运行的日志进程（含远程进程组查杀），
-// 再关闭所有机器连接（SSH keepalive/客户端）。供优雅关闭时调用。
+// Close 释放后端资源：先销毁所有 follow 会话（连带进程），再关闭所有机器连接
+// （SSH keepalive/客户端）。供优雅关闭时调用。
 func (s *Server) Close() {
+	s.sessions.mu.Lock()
+	sessions := make([]*viewSession, 0, len(s.sessions.m))
+	for _, sess := range s.sessions.m {
+		sessions = append(sessions, sess)
+	}
+	s.sessions.mu.Unlock()
+	for _, sess := range sessions {
+		sess.destroy()
+	}
 	s.procs.StopAll()
 	s.hosts.Close()
 }
@@ -219,6 +243,11 @@ func (s *Server) Router() *gin.Engine {
 
 	r.GET("/ws", s.handleWS)
 
+	// 可观测性端点：免鉴权（不含日志内容/敏感数据），便于监控系统直接抓取。
+	// /healthz 返回各主机连通状态；/metrics 暴露 Prometheus 指标。
+	r.GET("/healthz", s.handleHealthz)
+	r.GET("/metrics", gin.WrapH(metrics.Handler()))
+
 	// 静态资源（embed 的单文件前端）。
 	// 本工具每次发布都可能改 app.js/style.css，强制浏览器每次 revalidate，
 	// 避免用户拿到旧缓存导致"明明修了却还复现"的假象。
@@ -267,4 +296,56 @@ func (s *Server) handleCapabilities(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, h.Capabilities())
+}
+
+// hostHealth 是 /healthz 返回中单台主机的健康视图。
+type hostHealth struct {
+	Name      string `json:"name"`
+	Platform  string `json:"platform"`
+	Online    bool   `json:"online"`
+	Available bool   `json:"available"`
+	Message   string `json:"message,omitempty"`
+}
+
+// handleHealthz 返回所有主机的连通状态，供外部监控/负载均衡接入。
+// 对每台主机执行一次（被节流的）轻量探活：任一 SSH 主机不可用则整体 503 degraded，
+// 本机恒为 ok。免鉴权（不含敏感数据）。
+func (s *Server) handleHealthz(c *gin.Context) {
+	infos := s.hosts.List()
+	hosts := make([]hostHealth, 0, len(infos))
+	allOK := true
+	for _, info := range infos {
+		h, err := s.hosts.Get(info.Name)
+		if err != nil {
+			allOK = false
+			hosts = append(hosts, hostHealth{Name: info.Name, Message: err.Error()})
+			continue
+		}
+		// 触发一次节流后的探活，刷新在线状态。
+		checkErr := h.HealthCheck()
+		// 重新取 Info()，以便反映探活后的 online/lastErr。
+		fresh := h.Info()
+		available := checkErr == nil
+		if !available {
+			allOK = false
+		}
+		msg := fresh.Message
+		if checkErr != nil && msg == "" {
+			msg = checkErr.Error()
+		}
+		hosts = append(hosts, hostHealth{
+			Name:      info.Name,
+			Platform:  fresh.Platform,
+			Online:    fresh.Online,
+			Available: available,
+			Message:   msg,
+		})
+	}
+	status := http.StatusOK
+	overall := "ok"
+	if !allOK {
+		status = http.StatusServiceUnavailable
+		overall = "degraded"
+	}
+	c.JSON(status, gin.H{"status": overall, "hosts": hosts})
 }

@@ -123,8 +123,12 @@ tail/grep 残留。
 - 配置 CRUD：`/api/h/:host/config/list|get|save|delete|rename|setdefault|preview`，每台机器独立预设。
 - 导出：`GET /api/h/:host/file/download/origin`（原始字节，带 `Content-Length`）、
   `POST /api/h/:host/file/download/filter`（按当前表单过滤，流式输出）。
-- WebSocket：`/ws?host=<alias>`，上行 `start`/`stop`/`ping`，下行 `log`/`error`/`status`
-  （`running`/`stopped`/`waiting`/`alive`）/`reconnect`（主机热更后通知前端迁移连接）。
+- WebSocket：`/ws?host=<alias>`，上行 `start`/`attach`/`stop`/`ping`，下行 `log`（带 `seq`）
+  /`error`/`status`（`running`/`stopped`/`waiting`/`alive`）/`notice`（`rotate`/`truncate`/`gap`）
+  /`reconnect`（主机热更后通知前端迁移连接）。
+- 可观测性：`GET /healthz`（各主机连通状态，免鉴权）、`GET /metrics`（Prometheus，免鉴权）。
+  指标见 `internal/metrics`：`logviewer_ws_connections`、`logviewer_log_processes`、
+  `logviewer_ssh_reconnects_total`、`logviewer_export_bytes_total`、`logviewer_log_bytes_sent_total`。
 
 ## 请求流（一次实时跟踪）
 
@@ -145,6 +149,25 @@ tail/grep 残留。
   ├──────────────────────────►├─── procmgr.Stop() ───────► X
 ```
 
+### 断线会话解耦与补齐（follow 模式）
+
+follow 跟踪的会话（`viewSession`）与单个 WebSocket 连接解耦，进程不再随 WS 断开被杀：
+
+- 启动 follow 时生成 `sessionID`，随 `{type:"status",status:"running",sessionID,seq}` 下发；
+  每批日志分配单调递增 `seq`，写入 2MB 有界环形缓冲（按字节淘汰最旧批次）后再下发。
+- WS 断开：会话进入宽限期（`session_grace_seconds`，默认 45s），进程继续运行，输出照常入环
+  但不绑定连接。宽限到期才 `procmgr.Stop` 并销毁会话。
+- 重连：前端发 `{action:"attach",sessionID,lastSeq}`。会话仍存活则取消宽限定时器，在
+  `writeMu` 下补发所有 `seq>lastSeq` 的批次（保证补发帧先于后续实时帧，不乱序）；
+  若 `lastSeq < oldestSeq`（早期批次已被淘汰），先下发 `{type:"notice",kind:"gap"}` 提示部分丢失。
+  会话已失效则回退到全量 `start`。
+- 用户主动 stop / 切换文件 / 切换主机：立即销毁会话（不进宽限）。
+- 静态（非 follow）模式仍是一次性读取、连接绑定，断了即重来（无补齐意义）。
+
+stderr 经 `classifyStderr` 分类：`tail -F` 的"文件出现/建立"为良性噪声忽略；"被替换/轮转"与
+"文件截断"转为 `notice`（`rotate`/`truncate`）由前端显示非红色提示条；其余（grep/awk/iconv 报错等）
+为真实错误染红。
+
 ## 前端
 
 - 纯原生 HTML/CSS/JS，无构建步骤、无 npm。
@@ -154,7 +177,12 @@ tail/grep 残留。
   `buffer.active.baseY + length` 绝对坐标计算新增行（scrollback 封顶后仍正确），
   滚动位置跟随 `buffer.active.viewportY` 同步。
 - 时间选择器用 **flatpickr**（中文 locale），按天/时/分/秒四种粒度切换日期格式。
-- 主题用 CSS 变量 + `data-theme`，明/暗两套，xterm 的 theme 选项同步切换。
+- 主题用 CSS 变量 + `data-theme`，自动（跟随系统 `prefers-color-scheme`）/明/暗三态，
+  xterm 的 theme 选项同步切换。
+- 快捷键经 xterm 的 `attachCustomKeyEventHandler` 放行 Ctrl+F/Ctrl+C 等浏览器组合键（返回
+  `false` 让 xterm 不在捕获阶段 `preventDefault`），从根上修复搜索/复制被吞的问题。
+- 偏好（主题、语言、字号/行高密度、scrollback、侧栏宽度）统一存 `localStorage` 的
+  `logviewer-prefs` JSON；文案经 `static/i18n.js`（中/英，键集合由 `i18n.test.mjs` 校验）。
 
 ## 安全边界
 
@@ -224,6 +252,7 @@ LocalHost 始终保留（仅通过 `UpdateDirs` 更新根目录）。Reload 后�
 收到 SIGINT / SIGTERM 后：
 
 1. `http.Server.Shutdown` 停止接收新连接、等待进行中的 HTTP 请求结束（5 秒超时）；
-2. `Server.Close()` 先 `procmgr.StopAll()` 杀掉所有正在运行的日志进程（远程连同进程组
-   一起查杀，避免 tail/管道孤儿），再 `host.Manager.Close()` 关闭所有 SSH 客户端与
+2. `Server.Close()` 先在注册表锁内逐一 `viewSession.destroy()`（取消宽限定时器、杀掉
+   follow 进程并从注册表移除），再 `procmgr.StopAll()` 兜底回收静态进程（远程连同进程组
+   一起查杀，避免 tail/管道孤儿），最后 `host.Manager.Close()` 关闭所有 SSH 客户端与
    keepalive。顺序很重要：必须先杀进程再断 SSH，否则查杀命令发不出去。

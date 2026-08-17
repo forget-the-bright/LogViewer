@@ -29,6 +29,14 @@ type AppConfig struct {
 	Addr  string                `json:"addr"`
 	Auth  AuthConfig            `json:"auth"`
 	Hosts map[string]HostConfig `json:"hosts"`
+
+	// LogJSON 为 true 时以 JSON 格式输出自身日志（便于日志采集系统消费）。
+	LogJSON bool `json:"log_json"`
+	// LogLevel 控制日志级别：debug/info/warn/error，默认 info。
+	LogLevel string `json:"log_level"`
+	// SessionGraceSeconds 是 follow 模式下 WebSocket 断线后会话保留的宽限秒数，
+	// 在此期间重连可补齐断连间隙的日志。默认 45 秒。
+	SessionGraceSeconds int `json:"session_grace_seconds"`
 }
 
 // AuthConfig 控制登录认证。Enabled 为 false（默认）时完全不做登录校验，
@@ -290,6 +298,12 @@ func (c *AppConfig) applyDefaults() {
 	if c.Auth.SessionTTLMinutes == 0 {
 		c.Auth.SessionTTLMinutes = 720
 	}
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+	if c.SessionGraceSeconds == 0 {
+		c.SessionGraceSeconds = 45
+	}
 }
 
 // mergeLocalDirs 把命令行 -dir 合并进 hosts.local.dirs。
@@ -327,6 +341,14 @@ func (c *AppConfig) mergeLocalDirs(extraDirs []string) {
 func (c *AppConfig) Validate() error {
 	if len(c.Hosts) == 0 {
 		return errors.New("hosts 不能为空")
+	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("log_level 非法: %q（可选 debug/info/warn/error）", c.LogLevel)
+	}
+	if c.SessionGraceSeconds < 5 || c.SessionGraceSeconds > 3600 {
+		return fmt.Errorf("session_grace_seconds 非法: %d（应为 5-3600 秒）", c.SessionGraceSeconds)
 	}
 	for name, h := range c.Hosts {
 		if name == "" {
