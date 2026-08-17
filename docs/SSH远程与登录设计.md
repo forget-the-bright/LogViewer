@@ -285,7 +285,9 @@ type Host interface {
 
 - 用 `cmdbuild` 按已探测平台拼好 `Command{Platform, Shell, Script}`；
 - 通过 `ssh.Session` 执行：Unix 用 `sh -c '<script>'`，Windows 用
-  `powershell -NoProfile -NonInteractive -Command '<script>'`；
+  `<ps> -NoProfile -NonInteractive -EncodedCommand <b64>`（UTF-16LE base64 绕过
+  cmd 引号问题；`<ps>` 在连接初始化时探测，远端有 `pwsh` 则用 PowerShell 7+，
+  否则回退 `powershell` 5.1）；
 - `session.RequestPty("xterm", ...)`：让远程进程有控制终端，关闭会话时 SIGHUP 能送达
   进程组，配合远程命令本身在独立进程组运行，尽量不留孤儿；
 - 返回 `sshProc`（实现 `procmgr.Proc`），由 `procmgr` 统一读取/节流/停止。

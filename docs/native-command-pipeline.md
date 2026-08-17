@@ -35,21 +35,28 @@
 ## 2. 编码（GBK）
 
 - Unix：在读取命令后接 `iconv -f GBK -t UTF-8`。
-- Windows：用**运行时代码页分流**，避免在中文系统上为转码付出逐行开销：
+- Windows：需要同时兼容 **PowerShell 5.1**（系统自带）和 **PowerShell 7+（pwsh）**。
+  两者的关键差异是 `[Text.Encoding]::Default`：在 5.1 下返回系统 ANSI 代码页（中文系统
+  为 936），在 7+ 下因 .NET Core 行为变更**恒为 UTF-8（65001）**，直接用
+  `-Encoding Default` 在 pwsh 下会把 GBK 字节当 UTF-8 解码而乱码。因此按 PS 版本分流：
   ```powershell
-  if ([Text.Encoding]::Default.CodePage -eq 936) {
-      Get-Content ... -Encoding Default ...      # 中文系统：ANSI=936 即 GBK，纯原生零开销
+  if ($PSVersionTable.PSVersion.Major -ge 7) {
+      Get-Content ... -Encoding ([Text.Encoding]::GetEncoding(936)) ...   # PS7：显式 GBK，纯原生零开销
+  } elseif ([Text.Encoding]::GetEncoding(0).CodePage -eq 936) {
+      Get-Content ... -Encoding Default ...                              # PS5.1 中文系统：ANSI=936 即 GBK
   } else {
-      $lv_g=[Text.Encoding]::GetEncoding('GBK'); $lv_d=[Text.Encoding]::Default
+      $lv_g=[Text.Encoding]::GetEncoding('GBK'); $lv_d=[Text.Encoding]::GetEncoding(0)
       Get-Content ... -Encoding Default ... |
-        ForEach-Object { $lv_g.GetString($lv_d.GetBytes($_)) }   # 非中文系统：逐行转码
+        ForEach-Object { $lv_g.GetString($lv_d.GetBytes($_)) }            # PS5.1 非中文系统：逐行转码
   }
   ```
-  - 中文系统（代码页 936）`-Encoding Default` 直接读出 GBK 文本并经控制台 UTF-8 输出，
-    走原生 `-Tail/-Wait` 尾部定位，不引入逐行管道开销；
-  - 非中文系统（如英文 Windows 的 1252/437/850）`Default` 不是 GBK，才把读出的字符串
-    按 Default 编码反解为字节、再用 `GetEncoding('GBK')` 解码为正确文本；
-  - 静态全量无 `-Tail` 需求时用 `[IO.File]::ReadLines(<file>, GetEncoding('GBK'))`。
+  - PS 7+ 的 `-Encoding` 接受 `Encoding` 对象，直接传 `GetEncoding(936)` 显式按 GBK 读取，
+    纯原生、零转码开销，且与系统区域无关；
+  - PS 5.1 的 `-Encoding` 只认枚举，用 `GetEncoding(0).CodePage`（两个版本都返回真实
+    系统 ACP，不能用已在 PS7 失真的 `[Text.Encoding]::Default`）判断：ACP=936 时
+    `-Encoding Default` 原生零开销，非 936 才逐行转码；
+  - 静态全量无 `-Tail` 需求时用 `[IO.File]::ReadLines(<file>, GetEncoding('GBK'))`，
+    该写法在两个 PS 版本下都正确。
   - **不用 `-Encoding OEM`**：OEM 代码页区域相关，在英文 Windows 上是 CP437/850，会乱码。
   由于前面已把控制台输出编码设成 UTF-8，进程吐给 Go 的就是 UTF-8。
 

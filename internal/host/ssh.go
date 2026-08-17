@@ -56,6 +56,7 @@ type SSHHost struct {
 	client        *ssh.Client
 	sftpClient    *sftp.Client
 	realPlatform  string // 探测到的有效平台
+	hasPwsh       bool   // 远端 Windows 是否安装了 pwsh（PowerShell 7+）
 	realRoots     []string
 	caps          Capabilities
 	connected     bool
@@ -253,6 +254,7 @@ func (h *SSHHost) ensureConnected() error {
 	type initResult struct {
 		sc        *sftp.Client
 		platform  string
+		hasPwsh   bool
 		realRoots []string
 		caps      Capabilities
 		err       error
@@ -272,6 +274,11 @@ func (h *SSHHost) ensureConnected() error {
 				return
 			}
 		}
+		// Windows 远端探测是否有 pwsh（PowerShell 7+），有则优先用（启动比 5.1 快数倍）。
+		hasPwsh := false
+		if platform == "windows" {
+			hasPwsh = detectPwsh(client)
+		}
 		// 预解析根目录真实路径（用于符号链接逃逸校验）。
 		realRoots := make([]string, len(h.dirs))
 		sep := remoteSep(platform)
@@ -285,7 +292,7 @@ func (h *SSHHost) ensureConnected() error {
 			}
 		}
 		caps := detectCapabilities(client, platform)
-		initDone <- initResult{sc: sc, platform: platform, realRoots: realRoots, caps: caps}
+		initDone <- initResult{sc: sc, platform: platform, hasPwsh: hasPwsh, realRoots: realRoots, caps: caps}
 	}()
 
 	var res initResult
@@ -308,7 +315,7 @@ func (h *SSHHost) ensureConnected() error {
 		client.Close()
 		return h.recordErr(res.err)
 	}
-	sc, platform, realRoots, caps := res.sc, res.platform, res.realRoots, res.caps
+	sc, platform, hasPwsh, realRoots, caps := res.sc, res.platform, res.hasPwsh, res.realRoots, res.caps
 
 	h.mu.Lock()
 	// 区分"首次连接"与"断线重连"：曾经连通过，本次又是一次新的拨号，即一次重连。
@@ -316,6 +323,7 @@ func (h *SSHHost) ensureConnected() error {
 	h.client = client
 	h.sftpClient = sc
 	h.realPlatform = platform
+	h.hasPwsh = hasPwsh
 	h.realRoots = realRoots
 	h.caps = caps
 	h.connected = true
@@ -336,6 +344,7 @@ func (h *SSHHost) ensureConnected() error {
 
 	slog.Info("SSH 已连接",
 		"host", h.name, "platform", platform,
+		"pwsh7", hasPwsh,
 		"tail", caps.HasTail, "cat", caps.HasCat, "grep", caps.HasGrep,
 		"awk", caps.HasAwk, "iconv", caps.HasIconv, "reconnect", isReconnect)
 	if !caps.HasIconv || !caps.HasAwk {
@@ -615,12 +624,31 @@ func detectPlatform(client *ssh.Client) (string, error) {
 			return "windows", nil
 		}
 	}
-	if out, err := runRemote(client, `powershell -NoProfile -NonInteractive -Command "[Environment]::OSVersion.Platform]"`); err == nil {
+	if out, err := runRemote(client, `powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "[Environment]::OSVersion.Platform]"`); err == nil {
 		if strings.Contains(strings.ToLower(string(out)), "win32nt") || isWindowsOutput(out) {
 			return "windows", nil
 		}
 	}
 	return "", errors.New("uname/ver/powershell 均未识别出平台（远端可能是不支持的系统）")
+}
+
+// detectPwsh 探测远端 Windows 是否安装了 pwsh（PowerShell 7+）。
+// 用 `where pwsh`（cmd 内建可调用）或直接执行 `pwsh -Version` 判断。
+// 任何错误都视为不可用，安全回退到 powershell 5.1。
+func detectPwsh(client *ssh.Client) bool {
+	// 优先用 where（Win32-OpenSSH 默认 shell 是 cmd，where 是其原生命令）；
+	// 若默认 shell 被改成 PowerShell，where 仍可作为 Get-Command 的别名工作，
+	// 但输出格式不同，因此直接试执行 pwsh 更可靠。
+	out, err := runRemote(client, `pwsh -NoProfile -NonInteractive -Command "$PSVersionTable.PSVersion.Major"`)
+	if err != nil {
+		return false
+	}
+	// 输出应为纯数字（7/8...）；>=7 即 PowerShell 7+。
+	v := strings.TrimSpace(string(out))
+	if n, err := strconv.Atoi(v); err == nil && n >= 7 {
+		return true
+	}
+	return false
 }
 
 // isWindowsOutput 判断命令输出是否为 Windows 标识。"windows" 为 ASCII，

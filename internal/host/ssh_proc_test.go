@@ -116,7 +116,7 @@ func TestParseLvPid(t *testing.T) {
 
 func TestBuildRemoteExec_Unix(t *testing.T) {
 	cmd := unixViewCmdForTest()
-	line := buildRemoteExec(cmd)
+	line := buildRemoteExec(cmd, false)
 	if !strings.HasPrefix(line, "sh -c '") {
 		t.Errorf("unix exec should start with sh -c ', got: %s", line)
 	}
@@ -130,12 +130,13 @@ func TestBuildRemoteExec_Unix(t *testing.T) {
 
 func TestBuildRemoteExec_Windows(t *testing.T) {
 	cmd := windowsViewCmdForTest()
-	line := buildRemoteExec(cmd)
-	if !strings.HasPrefix(line, "powershell -NoProfile -NonInteractive -EncodedCommand ") {
-		t.Errorf("windows exec should use EncodedCommand, got: %s", line)
+
+	// 无 pwsh：用 powershell（5.1）
+	linePS := buildRemoteExec(cmd, false)
+	if !strings.HasPrefix(linePS, "powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ") {
+		t.Errorf("windows exec (no pwsh) should use powershell, got: %s", linePS)
 	}
-	// 解码 EncodedCommand 验证包含 PID 标记和原脚本
-	enc := strings.TrimPrefix(line, "powershell -NoProfile -NonInteractive -EncodedCommand ")
+	enc := strings.TrimPrefix(linePS, "powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ")
 	decoded, err := decodePS(enc)
 	if err != nil {
 		t.Fatalf("decode encoded command: %v", err)
@@ -145,6 +146,12 @@ func TestBuildRemoteExec_Windows(t *testing.T) {
 	}
 	if !strings.Contains(decoded, "Get-Content") {
 		t.Errorf("encoded script should contain original Get-Content, got: %s", decoded)
+	}
+
+	// 有 pwsh：用 pwsh（7+）
+	linePwsh := buildRemoteExec(cmd, true)
+	if !strings.HasPrefix(linePwsh, "pwsh -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ") {
+		t.Errorf("windows exec (pwsh) should use pwsh, got: %s", linePwsh)
 	}
 }
 

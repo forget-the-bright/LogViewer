@@ -77,8 +77,8 @@ func (h *LocalHost) addRoot(p string) {
 	h.realRoots = append(h.realRoots, real)
 }
 
-func (h *LocalHost) Name() string            { return h.name }
-func (h *LocalHost) Platform() string        { return h.platform }
+func (h *LocalHost) Name() string             { return h.name }
+func (h *LocalHost) Platform() string         { return h.platform }
 func (h *LocalHost) Configs() *config.Manager { return h.cfgMgr }
 
 // Fingerprint 返回本机实例的连接配置指纹，供 Manager.Rebuild 判断是否需要替换。

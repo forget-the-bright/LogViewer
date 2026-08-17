@@ -46,9 +46,19 @@ type sshProc struct {
 	killCalled bool
 }
 
+// remoteShellExe 返回远端 Windows 应使用的 PowerShell 可执行文件名：
+// 有 pwsh（7+）时用 pwsh（启动快数倍），否则回退 powershell（5.1）。
+func remoteShellExe(hasPwsh bool) string {
+	if hasPwsh {
+		return "pwsh"
+	}
+	return "powershell"
+}
+
 // buildRemoteExec 把 cmdbuild.Command 翻译成要通过 SSH exec 发送的命令行。
 // 同时在脚本前注入 PID 标记，供 Kill 精确定位远程进程组。
-func buildRemoteExec(cmd cmdbuild.Command) string {
+// hasPwsh 为 true 时用 pwsh（PowerShell 7+），否则用 powershell 5.1。
+func buildRemoteExec(cmd cmdbuild.Command, hasPwsh bool) string {
 	if cmd.Shell == "powershell" {
 		// PowerShell：在脚本前加一行把 $PID 打到 stderr，然后执行原脚本。
 		// 用 -EncodedCommand（UTF-16LE base64）完全绕过 cmd.exe 的引号转义问题。
@@ -58,12 +68,13 @@ func buildRemoteExec(cmd cmdbuild.Command) string {
 			// 静默进度记录，避免 PowerShell 把"正在准备首次使用模块"等进度以 CLIXML 写入 stderr，污染前端错误提示。
 			"$ProgressPreference='SilentlyContinue'\n" +
 			cmd.Script
-		return "powershell -NoProfile -NonInteractive -EncodedCommand " + encodePS(wrapped)
+		slog.Info("执行远程命令", "shell", remoteShellExe(hasPwsh))
+		return remoteShellExe(hasPwsh) + " -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + encodePS(wrapped)
 	}
 	// Unix：用 sh -c 执行。先 echo PID 到 stderr，再运行原脚本。
 	// 用 printf 避免 echo 在不同 shell 下的差异；单引号转义复用 cmdbuild.shQuote 风格。
-	wrapped := "printf 'LV_PID=%s\\n' \"$$\" >&2; " + cmd.Script
-	return "sh -c " + shSingleQuote(wrapped)
+	wrapped := "printf 'LV_PID=%s\\n' \"$$\" >&2; " + cmd.Script // 将当前 shell 进程 PID 写入 stderr
+	return "sh -c " + shSingleQuote(wrapped)                     // 使用 sh 执行封装后的命令
 }
 
 // encodePS 把 PowerShell 脚本编码为 -EncodedCommand 所需的 UTF-16LE base64。
@@ -105,16 +116,20 @@ func (h *SSHHost) newProc(cmd cmdbuild.Command) (*sshProc, error) {
 		return nil, err
 	}
 	platform := h.Platform()
+	h.mu.Lock()
+	hasPwsh := h.hasPwsh
+	h.mu.Unlock()
 	return &sshProc{
 		host:     h,
 		platform: platform,
-		cmdLine:  buildRemoteExec(cmd),
+		cmdLine:  buildRemoteExec(cmd, hasPwsh),
 		pidCh:    make(chan struct{}),
 	}, nil
 }
 
 // Run 在远程机器上执行命令管道，返回可被 procmgr 管控的进程。
 func (h *SSHHost) Run(cmd cmdbuild.Command) (procmgr.Process, error) {
+
 	return h.newProc(cmd)
 }
 
@@ -288,9 +303,14 @@ func (h *SSHHost) RunOneShot(cmd cmdbuild.Command) (string, int, error) {
 	}
 	defer sess.Close()
 
+	// 读取探测到的 pwsh 可用性（重连后可能变化）。
+	h.mu.Lock()
+	hasPwsh := h.hasPwsh
+	h.mu.Unlock()
+
 	// 一次性短命令不需要 PID 标记/进程树管控，直接按 shell 执行即可，
 	// 避免 LV_PID 标记行污染校验输出。
-	cmdline := oneShotCmdLine(cmd)
+	cmdline := oneShotCmdLine(cmd, hasPwsh)
 	out, runErr := sess.CombinedOutput(cmdline)
 	if runErr == nil {
 		return string(out), 0, nil
@@ -303,9 +323,9 @@ func (h *SSHHost) RunOneShot(cmd cmdbuild.Command) (string, int, error) {
 }
 
 // oneShotCmdLine 把 cmdbuild.Command 翻译成一次性执行的命令行（不注入 PID 标记）。
-func oneShotCmdLine(cmd cmdbuild.Command) string {
+func oneShotCmdLine(cmd cmdbuild.Command, hasPwsh bool) string {
 	if cmd.Shell == "powershell" {
-		return "powershell -NoProfile -NonInteractive -EncodedCommand " + encodePS(cmd.Script)
+		return remoteShellExe(hasPwsh) + " -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + encodePS(cmd.Script)
 	}
 	return "sh -c " + shSingleQuote(cmd.Script)
 }
@@ -374,11 +394,11 @@ const maxPidBannerLines = 8
 // 而非只看第一行——否则 banner 会让 setPid 永远不被调用，导致 Kill 无法
 // 精确定位远程进程树，留下孤儿 PowerShell/tail 进程。
 type pidFilterReader struct {
-	src       *bufio.Reader
-	proc      *sshProc
-	scanning  bool   // 是否仍在寻找 LV_PID 标记
-	passed    int    // 已扫描的非标记行数
-	buf       []byte // 透传缓冲
+	src      *bufio.Reader
+	proc     *sshProc
+	scanning bool   // 是否仍在寻找 LV_PID 标记
+	passed   int    // 已扫描的非标记行数
+	buf      []byte // 透传缓冲
 }
 
 func newPidFilterReader(r io.Reader, proc *sshProc) *pidFilterReader {
@@ -435,4 +455,3 @@ func parseLvPid(line string) (int, bool) {
 	}
 	return pid, true
 }
-

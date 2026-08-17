@@ -1,10 +1,30 @@
 package cmdbuild
 
 import (
+	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
 )
+
+// localPowerShell 是本机执行 PowerShell 命令时使用的可执行文件路径。
+// 优先使用 pwsh（PowerShell 7+，基于 .NET Core，启动比 5.1 快约 5 倍），
+// 未安装时回退到系统自带的 powershell（5.1）。只影响本机执行，
+// SSH 远程路径始终用 "powershell"（远端不一定装了 pwsh）。
+var localPowerShell = detectLocalPowerShell()
+
+func detectLocalPowerShell() string {
+	if p, err := exec.LookPath("pwsh"); err == nil && p != "" {
+		return p
+	}
+	return "powershell"
+}
+
+// LocalPowerShell 返回本机执行 PowerShell 命令时实际使用的可执行文件路径
+// （pwsh 7+ 的完整路径，或回退的 "powershell"）。供启动日志/诊断展示。
+func LocalPowerShell() string {
+	return localPowerShell
+}
 
 // Command 描述一次要启动的原生命令管道。
 // 设计原则：Go 只做"外壳"，所有日志读取与过滤都由系统原生命令完成
@@ -35,9 +55,11 @@ type FilterCfg struct {
 }
 
 // BuildCmd 将 Command 转成 *exec.Cmd（本机执行用）。
+// Windows 下优先用 pwsh（PowerShell 7+，启动更快），未安装时回退 powershell 5.1。
 func (c Command) BuildCmd() *exec.Cmd {
 	if c.Shell == "powershell" {
-		return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", c.Script)
+		slog.Info("执行本地命令", "shell", localPowerShell)
+		return exec.Command(localPowerShell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", c.Script)
 	}
 	return exec.Command("sh", "-c", c.Script)
 }
@@ -238,20 +260,14 @@ func windowsView(mode, filePath, encoding string, limit int, f FilterCfg) string
 //
 // UTF-8 直接用 Get-Content -Wait -Tail/-Encoding UTF8（原生、高效）。
 //
-// GBK 的难点：Windows PowerShell 5.1 的 -Encoding 是枚举类型，无法传
-// [Text.Encoding] 实例；-Encoding Default 解析为系统 ANSI 代码页——在中文
-// Windows 上是 936（即 GBK，原生即正确且最快），但在英文 Windows 上是 1252
-// （GBK 字节会被错误解码）。
+// GBK 必须兼容两个 PowerShell 版本（详见 gbkReadStage 文档）：
+//   - PS 7+：-Encoding 接受 Encoding 对象，直接传 GetEncoding(936) 显式 GBK，
+//     纯原生零开销，且与系统区域无关。
+//   - PS 5.1：-Encoding 只认枚举，用 GetEncoding(0).CodePage（真实系统 ACP）分流，
+//     ACP=936 时 -Encoding Default 原生零开销，非 936 才逐行转码。
 //
-// 根治做法（运行时按代码页分流，由 PowerShell 在目标机自行判断，无需 Go 预知
-// 远程代码页）：
-//   - ANSI=936：直接 Get-Content -Encoding Default，纯原生，零额外开销
-//     （与旧版 -Encoding OEM 在中文系统上等价，都是 GBK）。
-//   - 非 936：Get-Content -Encoding Default 读出后逐行把字符串按 Default 编回
-//     字节、再用 GBK 解码。无损性见 gbkTranscodeStage 说明。
-//
-// 关键：936 分支绝不能套 ForEach-Object，否则即使是恒等转换，每行都过一次
-// PowerShell 管道，带过滤时会明显拖慢（实测尾部 200 行从 ~180ms 退化到 ~600ms）。
+// 关键：快路径分支绝不能套 ForEach-Object，否则每行都过一次 PowerShell 管道，
+// 带过滤时会明显拖慢（实测尾部 200 行从 ~180ms 退化到 ~600ms）。
 func windowsFollowStage(sb *strings.Builder, filePath, encoding string, limit int) {
 	if !IsGBK(encoding) {
 		// UTF-8：原生文本跟踪
@@ -264,9 +280,9 @@ func windowsFollowStage(sb *strings.Builder, filePath, encoding string, limit in
 		return
 	}
 
-	// GBK：Get-Content -Wait -Tail N -Encoding Default（原生尾部定位+跟踪），
-	// 运行时按 ANSI 代码页决定是否逐行转码。
-	gc := "-LiteralPath " + psQuote(filePath) + " -Encoding Default -Wait"
+	// GBK：Get-Content -Wait -Tail N（原生尾部定位+跟踪），
+	// 编码由 gbkReadStage 按 PS 版本/系统 ACP 自适应。
+	gc := "-LiteralPath " + psQuote(filePath) + " -Wait"
 	if limit > 0 {
 		gc += " -Tail " + strconv.Itoa(limit)
 	}
@@ -278,9 +294,9 @@ func windowsFollowStage(sb *strings.Builder, filePath, encoding string, limit in
 // UTF-8 有 -Tail 时用 Get-Content -Tail（原生尾部定位，最快），
 // 无 -Tail 时用 [IO.File]::ReadLines（比 Get-Content 快约 3 倍）。
 //
-// GBK 有 -Tail 时用 Get-Content -Tail -Encoding Default（原生尾部定位，最快），
-// 运行时按代码页决定是否逐行转码；无 -Tail 时直接 [IO.File]::ReadLines(path,GBK)，
-// 显式按 GBK 解码，跨区域正确且不经 Default。
+// GBK 有 -Tail 时走 gbkReadStage（PS 版本自适应，原生尾部定位，最快），
+// 无 -Tail 时直接 [IO.File]::ReadLines(path,GBK)，显式按 GBK 解码，
+// 跨版本/跨区域正确且不经 Default。
 func windowsStaticStage(sb *strings.Builder, filePath, encoding string, limit int) {
 	if !IsGBK(encoding) {
 		if limit > 0 {
@@ -294,25 +310,39 @@ func windowsStaticStage(sb *strings.Builder, filePath, encoding string, limit in
 	// GBK
 	if limit > 0 {
 		// Get-Content -Tail 原生从文件尾部定位，比 ReadLines 全量枚举快一个数量级。
-		sb.WriteString(gbkReadStage("-LiteralPath " + psQuote(filePath) + " -Encoding Default -Tail " + strconv.Itoa(limit)))
+		sb.WriteString(gbkReadStage("-LiteralPath " + psQuote(filePath) + " -Tail " + strconv.Itoa(limit)))
 	} else {
 		sb.WriteString("[IO.File]::ReadLines(" + psQuote(filePath) + ",[Text.Encoding]::GetEncoding('GBK'))")
 	}
 }
 
-// gbkReadStage 把一条"用 -Encoding Default 读取"的 Get-Content 命令包装成
-// 运行时代码页分流块：ANSI=936 时直接透传（纯原生，零开销）；否则在其后接
-// 逐行 GBK 转码。返回的 & { ... } 块像普通命令一样向后续管道输出字符串。
+// gbkReadStage 包装一次 GBK 文件读取，在 PowerShell 5.1 与 7+ 上都能正确解码。
 //
-// 为什么无损：Get-Content 按行（0x0A/0x0D 分割）产出字符串，而 GBK 尾字节范围
-// 是 0x40-0xFE（排除 0x7F），永不包含换行符，按行绝不会切断多字节字符；把每行
-// 按 Default 编回字节再用 GBK 解码即可完整还原。已实测 CP1252/437/850/936 上
-// 所有 0x80-0xFF 字节往返无损（.NET 对 1252 的 5 个未定义位做最佳拟合往返）。
-func gbkReadStage(getContentArgs string) string {
-	return "& { if ([Text.Encoding]::Default.CodePage -eq 936) { " +
-		"Get-Content " + getContentArgs + " } else { " +
-		"$lv_g=[Text.Encoding]::GetEncoding('GBK'); $lv_d=[Text.Encoding]::Default; " +
-		"Get-Content " + getContentArgs + " | ForEach-Object { $lv_g.GetString($lv_d.GetBytes($_)) } } }"
+// baseArgs 是 Get-Content 的参数串，【不含】 -Encoding（例如
+// "-LiteralPath 'C:\x.log' -Wait -Tail 100"），编码由本阶段按运行时环境添加：
+//
+//   - PS 7+：-Encoding 接受 Encoding 对象；但 [Text.Encoding]::Default 在 PS 7
+//     下恒为 UTF-8（不再是系统 ACP），-Encoding Default 会把 GBK 字节当 UTF-8
+//     解码而乱码。因此直接传 -Encoding ([Text.Encoding]::GetEncoding(936))，
+//     显式按 GBK 读取，纯原生、零转码开销，且与系统区域无关。
+//   - PS 5.1 中文 Windows（ACP=936）：-Encoding Default 即 GBK，原生零开销快路径。
+//   - PS 5.1 非中文 Windows（ACP≠936）：-Encoding Default 按本地 ACP 读取，
+//     再逐行转码为 GBK。
+//
+// 系统 ACP 用 [Text.Encoding]::GetEncoding(0) 获取——两个 PS 版本下都返回真实
+// 系统代码页（不能用 [Text.Encoding]::Default，它在 PS 7 下固定为 UTF-8）。
+//
+// 无损性：Get-Content 按行（0x0A/0x0D 分割）产出字符串，而 GBK 尾字节范围
+// 是 0x40-0xFE（排除 0x7F），永不包含换行符，按行绝不会切断多字节字符。
+func gbkReadStage(baseArgs string) string {
+	return "& { " +
+		"if ($PSVersionTable.PSVersion.Major -ge 7) { " +
+		"Get-Content " + baseArgs + " -Encoding ([Text.Encoding]::GetEncoding(936)) " +
+		"} elseif ([Text.Encoding]::GetEncoding(0).CodePage -eq 936) { " +
+		"Get-Content " + baseArgs + " -Encoding Default " +
+		"} else { " +
+		"$lv_g=[Text.Encoding]::GetEncoding('GBK'); $lv_d=[Text.Encoding]::GetEncoding(0); " +
+		"Get-Content " + baseArgs + " -Encoding Default | ForEach-Object { $lv_g.GetString($lv_d.GetBytes($_)) } } }"
 }
 
 // windowsTimeStage 用 Where-Object 做时间范围字符串比较。

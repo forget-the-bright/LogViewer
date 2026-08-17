@@ -49,8 +49,9 @@ TOFU（默认写入 `~/.ssh/known_hosts`，首次落盘后严格校验）、`una
 而是按目标平台分隔符做词法清洗 + SFTP `RealPath` 解析符号链接，防止跨平台路径穿越与软链逃逸。
 
 远程命令执行由 `sshProc` 实现（`internal/host/ssh_proc.go`）：把 cmdbuild 生成的脚本
-包成 `sh -c '<script>'`（Unix）或 `powershell -NoProfile -NonInteractive -EncodedCommand
-<b64>`（Windows，UTF-16LE base64 绕过 cmd 引号问题），在 SSH session 上启动，stdout/stderr
+包成 `sh -c '<script>'`（Unix）或 `<ps> -NoProfile -NonInteractive -EncodedCommand
+<b64>`（Windows，UTF-16LE base64 绕过 cmd 引号问题；`<ps>` 在连接初始化时探测，
+远端有 `pwsh` 则用 7+，否则回退 `powershell` 5.1），在 SSH session 上启动，stdout/stderr
 交给 procmgr 同一套读取/节流逻辑。远端进程树查杀靠 **PID 标记**：脚本开头向 stderr 打印
 `LV_PID=<pid>`（Unix 用 `printf '%s' "$"`，Windows 用 `$PID`），`pidFilterReader`
 拦截首行解析出 PID，停止时另开一条 SSH 连接执行整组查杀（Unix `kill -KILL -<pgid>`，
@@ -71,7 +72,9 @@ tail/grep 残留。
 - `BuildOrigin(file)` → 原样导出文件字节
 - `BuildExport(...)` → 过滤导出（等价于 static 模式的 View）
 - `BuildCmd()` 把 `Command` 转成 `*exec.Cmd`，Unix 走 `sh -c`，Windows 走
-  `powershell -NoProfile -NonInteractive -Command`。
+  `<ps> -NoProfile -NonInteractive -WindowStyle Hidden -Command`，其中 `<ps>`
+  在本机优先用 `pwsh`（PowerShell 7+，启动比 5.1 快约 5 倍），未安装时回退
+  `powershell`（5.1）。
 
 平台分支：
 

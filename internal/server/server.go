@@ -74,14 +74,14 @@ func (s *Server) logCmd(kind, host string, cmd cmdbuild.Command) {
 // New 创建 Server。
 func New(opts Options) *Server {
 	srv := &Server{
-		hosts:        opts.Hosts,
-		procs:        procmgr.NewManager(),
-		static:       opts.Static,
-		auth:         newAuthService(opts.Auth),
-		configPath:   opts.ConfigPath,
-		reloadFn:     opts.ReloadFunc,
-		wsClients:    map[*wsClient]string{},
-		sessionGrace: opts.SessionGrace,
+		hosts:         opts.Hosts,
+		procs:         procmgr.NewManager(),
+		static:        opts.Static,
+		auth:          newAuthService(opts.Auth),
+		configPath:    opts.ConfigPath,
+		reloadFn:      opts.ReloadFunc,
+		wsClients:     map[*wsClient]string{},
+		sessionGrace:  opts.SessionGrace,
 		logCommandsFn: opts.LogCommandsFunc,
 	}
 	srv.sessions = newSessionRegistry(srv)

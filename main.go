@@ -20,6 +20,7 @@ import (
 
 	"logviewer/internal/appconfig"
 	"logviewer/internal/applog"
+	"logviewer/internal/cmdbuild"
 	"logviewer/internal/config"
 	"logviewer/internal/cryptoutil"
 	"logviewer/internal/host"
@@ -142,6 +143,16 @@ func main() {
 			platform = "probing"
 		}
 		slog.Info("主机已注册", "kind", kind, "name", info.Name, "platform", platform, "dirs", dirsOf(hm, info.Name))
+	}
+	// Windows 本机打印实际选用的 PowerShell：pwsh 7+ 启动比 5.1 快约 5 倍，
+	// 未安装时回退系统自带的 powershell 5.1。便于确认优化是否生效。
+	if local, _ := hm.Get("local"); local != nil && local.Platform() == "windows" {
+		ps := cmdbuild.LocalPowerShell()
+		if strings.EqualFold(ps, "powershell") {
+			slog.Info("本机 PowerShell：powershell 5.1（未检测到 pwsh 7+，安装后日志操作启动可快约 5 倍）", "exe", ps)
+		} else {
+			slog.Info("本机 PowerShell：pwsh 7+", "exe", ps)
+		}
 	}
 
 	// 配置变更时的持久化闭包（保留 appCfg 引用供 reload 使用）

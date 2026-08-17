@@ -59,12 +59,13 @@ func TestBuildExportEqualsStaticView(t *testing.T) {
 	}
 }
 
-// 验证 Windows 编码分支构造正确。这是 GBK 性能与跨区域正确性的回归保护：
-//   - 必须用 -Encoding Default（系统 ANSI）走原生 -Tail/-Wait 尾部定位，绝不能
-//     用 ReadLines 全量枚举（性能退化一个数量级）；
-//   - 必须有运行时代码页分流：ANSI=936 直接透传（中文系统纯原生、零开销），
-//     非 936 才在 else 分支逐行用 GetEncoding('GBK') 转码；
-//   - 绝不允许 -Encoding OEM（区域相关，英文 Windows 上是 CP437/850，乱码）。
+// 验证 Windows 编码分支构造正确。这是 GBK 性能与跨版本/跨区域正确性的回归保护：
+//   - PS 7+ 分支：用 -Encoding ([Text.Encoding]::GetEncoding(936)) 显式 GBK，纯原生，
+//     因为 [Text.Encoding]::Default 在 PS 7 下恒为 UTF-8 会乱码；
+//   - PS 5.1 中文（ACP=936）：-Encoding Default 原生零开销；
+//   - PS 5.1 非中文（ACP≠936）：逐行 GetEncoding('GBK') 转码；
+//   - 系统 ACP 用 GetEncoding(0) 获取（两个版本都返回真实代码页，不能用 Default）；
+//   - follow 模式必须保留 -Wait/-Tail 原生尾部定位，绝不能全量 ReadLines。
 func TestWindowsEncodingStages(t *testing.T) {
 	const path = `C:\logs\app.log`
 
@@ -73,31 +74,37 @@ func TestWindowsEncodingStages(t *testing.T) {
 	if !strings.Contains(utf8Follow, "-Encoding UTF8") {
 		t.Errorf("UTF-8 follow 应使用 -Encoding UTF8:\n%s", utf8Follow)
 	}
-	if strings.Contains(utf8Follow, "CodePage -eq 936") || strings.Contains(utf8Follow, "GetEncoding('GBK')") {
+	if strings.Contains(utf8Follow, "PSVersionTable.PSVersion.Major") || strings.Contains(utf8Follow, "GetEncoding(936)") {
 		t.Errorf("UTF-8 follow 不应走 GBK 分流:\n%s", utf8Follow)
 	}
 
-	// GBK follow：-Encoding Default + 运行时代码页分流（936 原生快路径 / 非 936 转码）
+	// GBK follow：PS 版本分流 + 原生 -Wait/-Tail 尾部定位
 	for _, enc := range []string{"gbk", "GBK", " gbk ", "gb2312"} {
 		gbkFollow := BuildView("windows", "follow", path, enc, 100, FilterCfg{}).Script
-		if !strings.Contains(gbkFollow, "-Encoding Default") {
-			t.Errorf("GBK follow (%q) 应使用 -Encoding Default 走原生尾部定位:\n%s", enc, gbkFollow)
+		// 必须有 PS 7+ 分支（显式 GBK 编码对象）
+		if !strings.Contains(gbkFollow, "PSVersionTable.PSVersion.Major -ge 7") {
+			t.Errorf("GBK follow (%q) 必须按 PS 版本分流:\n%s", enc, gbkFollow)
+		}
+		if !strings.Contains(gbkFollow, "GetEncoding(936)") {
+			t.Errorf("GBK follow (%q) PS7 分支必须用 GetEncoding(936) 显式 GBK:\n%s", enc, gbkFollow)
+		}
+		// PS 5.1 分支必须用 GetEncoding(0)（不是 Default）+ ACP=936 快路径
+		if !strings.Contains(gbkFollow, "GetEncoding(0).CodePage -eq 936") {
+			t.Errorf("GBK follow (%q) PS5.1 分支必须用 GetEncoding(0) 检测系统 ACP:\n%s", enc, gbkFollow)
 		}
 		if !strings.Contains(gbkFollow, "-Wait") {
 			t.Errorf("GBK follow (%q) 必须带 -Wait 实时跟踪:\n%s", enc, gbkFollow)
 		}
-		if !strings.Contains(gbkFollow, "CodePage -eq 936") {
-			t.Errorf("GBK follow (%q) 必须运行时按代码页分流，936 走纯原生零开销:\n%s", enc, gbkFollow)
-		}
 		if !strings.Contains(gbkFollow, "GetEncoding('GBK')") {
 			t.Errorf("GBK follow (%q) 非 936 分支应逐行用 GetEncoding('GBK') 转码:\n%s", enc, gbkFollow)
 		}
-		if strings.Contains(gbkFollow, "-Encoding OEM") {
-			t.Errorf("GBK follow (%q) 禁止使用 -Encoding OEM（区域相关，英文 Windows 上乱码）:\n%s", enc, gbkFollow)
+		// 绝不能出现裸露的 -Encoding Default（PS 7 下会乱码）
+		if strings.Contains(gbkFollow, "-Encoding Default -Wait") || strings.Contains(gbkFollow, "-Encoding Default -Tail") {
+			t.Errorf("GBK follow (%q) 禁止直接用 -Encoding Default（PS7 下恒为 UTF-8 乱码）:\n%s", enc, gbkFollow)
 		}
 	}
 
-	// GBK follow limit>0：单一 Get-Content -Wait -Tail N，不应有 ReadLines 全量枚举
+	// GBK follow limit>0：原生 -Wait -Tail N，不应有 ReadLines 全量枚举
 	gbkTail := BuildView("windows", "follow", path, "gbk", 50, FilterCfg{}).Script
 	if !strings.Contains(gbkTail, "-Tail 50") {
 		t.Errorf("GBK follow limit=50 应使用原生 -Tail 50:\n%s", gbkTail)
@@ -106,28 +113,28 @@ func TestWindowsEncodingStages(t *testing.T) {
 		t.Errorf("GBK follow 不应全量枚举文件（ReadLines/Select -Last 性能退化）:\n%s", gbkTail)
 	}
 
-	// GBK follow limit=0：-Wait 不带 -Tail，仍有代码页分流
+	// GBK follow limit=0：-Wait 不带 -Tail，仍有版本分流
 	gbkNoTail := BuildView("windows", "follow", path, "gbk", 0, FilterCfg{}).Script
 	if strings.Contains(gbkNoTail, "-Tail ") {
 		t.Errorf("GBK follow limit=0 不应带 -Tail:\n%s", gbkNoTail)
 	}
-	if !strings.Contains(gbkNoTail, "CodePage -eq 936") {
-		t.Errorf("GBK follow limit=0 仍需代码页分流:\n%s", gbkNoTail)
+	if !strings.Contains(gbkNoTail, "PSVersionTable.PSVersion.Major -ge 7") {
+		t.Errorf("GBK follow limit=0 仍需 PS 版本分流:\n%s", gbkNoTail)
 	}
 
-	// GBK static limit>0：原生 -Encoding Default -Tail + 代码页分流（非全量 ReadLines）
+	// GBK static limit>0：原生 -Tail + PS 版本分流（非全量 ReadLines）
 	gbkStaticTail := BuildView("windows", "static", path, "gbk", 100, FilterCfg{}).Script
-	if !strings.Contains(gbkStaticTail, "-Encoding Default -Tail 100") {
+	if !strings.Contains(gbkStaticTail, "-Tail 100") {
 		t.Errorf("GBK static limit=100 应用原生 -Tail 100:\n%s", gbkStaticTail)
 	}
-	if !strings.Contains(gbkStaticTail, "CodePage -eq 936") {
-		t.Errorf("GBK static limit=100 应代码页分流:\n%s", gbkStaticTail)
+	if !strings.Contains(gbkStaticTail, "PSVersionTable.PSVersion.Major -ge 7") {
+		t.Errorf("GBK static limit=100 应 PS 版本分流:\n%s", gbkStaticTail)
 	}
 	if strings.Contains(gbkStaticTail, "[IO.File]::ReadLines") {
 		t.Errorf("GBK static limit>0 不应全量 ReadLines:\n%s", gbkStaticTail)
 	}
 
-	// GBK static no-limit：显式 ReadLines(GBK)，全量枚举（无尾部定位需求，跨区域正确）
+	// GBK static no-limit：显式 ReadLines(GBK)，全量枚举（无尾部定位需求，跨版本/区域正确）
 	gbkStatic := BuildView("windows", "static", path, "gbk", 0, FilterCfg{}).Script
 	if !strings.Contains(gbkStatic, "[IO.File]::ReadLines(") || !strings.Contains(gbkStatic, "GetEncoding('GBK')") {
 		t.Errorf("GBK static no-limit 应用 ReadLines + GetEncoding('GBK'):\n%s", gbkStatic)

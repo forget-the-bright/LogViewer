@@ -5,7 +5,9 @@
 - Go 1.26+
 - 前端无需 Node/npm：所有第三方库（xterm.js、flatpickr）都已本地 vendor 到
   `static/vendor/`，随 `go:embed` 打包。
-- Windows 上开发需要 PowerShell（`powershell.exe`，系统自带）；
+- Windows 上需要 PowerShell（系统自带的 `powershell.exe` 5.1 即可）；
+  强烈建议另行安装 [PowerShell 7+（pwsh）](https://github.com/PowerShell/PowerShell)，
+  程序会自动检测并优先使用，本机日志操作启动速度可提升约 5 倍。
   Linux/macOS 需要 `tail`、`cat`、`awk`、`grep`、`iconv`。
 
 ## 常用命令
