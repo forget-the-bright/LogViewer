@@ -38,6 +38,8 @@ type AppConfig struct {
 	// 用于开发调试（排查命令构造、性能问题）。默认 false；生产环境不建议开启
 	// （follow 模式下会持续输出，且命令可能包含文件路径）。
 	LogCommands bool `json:"log_commands"`
+	// GinModeDebug 为 true 时启用 gin 调试模式，便于开发时调试路由。默认 false。
+	GIN_MODE_DEBUG bool `json:"gin_mode_debug"`
 	// SessionGraceSeconds 是 follow 模式下 WebSocket 断线后会话保留的宽限秒数，
 	// 在此期间重连可补齐断连间隙的日志。默认 45 秒。
 	SessionGraceSeconds int `json:"session_grace_seconds"`
@@ -163,11 +165,11 @@ type SSHConfig struct {
 
 // HostConfig 是一台机器（本机或远程）的配置。
 type HostConfig struct {
-	SSH            *SSHConfig          `json:"ssh,omitempty"`
-	Platform       string              `json:"platform,omitempty"`
-	Dirs           []string            `json:"dirs"`
-	FileExtensions []string            `json:"file_extensions,omitempty"`
-	Configs        config.ConfigStore  `json:"configs"`
+	SSH            *SSHConfig         `json:"ssh,omitempty"`
+	Platform       string             `json:"platform,omitempty"`
+	Dirs           []string           `json:"dirs"`
+	FileExtensions []string           `json:"file_extensions,omitempty"`
+	Configs        config.ConfigStore `json:"configs"`
 }
 
 // Locate 按以下顺序查找配置文件：explicit → <exeDir>/logviewer.json → <cwd>/logviewer.json。

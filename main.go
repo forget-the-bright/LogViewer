@@ -25,6 +25,8 @@ import (
 	"logviewer/internal/host"
 	"logviewer/internal/metrics"
 	"logviewer/internal/server"
+
+	"github.com/gin-gonic/gin"
 )
 
 //go:embed all:static
@@ -106,7 +108,9 @@ func main() {
 	// 尽早初始化结构化日志：此后所有 log.Printf 都会被重定向到 slog。
 	applog.Init(appCfg.LogJSON, appCfg.LogLevel)
 	slog.Info("配置文件已加载", "path", cfgPath, "log_json", appCfg.LogJSON, "log_level", appCfg.LogLevel)
-
+	if !appCfg.GIN_MODE_DEBUG {
+		gin.SetMode(gin.ReleaseMode)
+	}
 	// 如果配置中有加密密码，必须提供密钥并在内存中解密
 	if appCfg.HasEncryptedPasswords() {
 		if key == "" {

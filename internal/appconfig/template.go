@@ -47,6 +47,8 @@ func defaultTemplate() string {
   // 开发调试用：true 时把每条发往目标机器的查询/导出/正则校验命令打印到服务端日志。
   // 默认 false。生产环境不建议开启（follow 模式会持续输出，且命令可能包含文件路径）。
   "log_commands": false,
+  // Gin 调试模式：true 时启用 gin 路由调试，便于开发时调试。默认 false。
+  "gin_mode_debug": false,
   // follow 跟踪模式下，WebSocket 断线后服务端保留会话（继续缓冲日志）的宽限秒数。
   // 在此期间重连可自动补齐断连间隙的日志；超时则回收进程。默认 45，范围 5-3600。
   "session_grace_seconds": 45,
