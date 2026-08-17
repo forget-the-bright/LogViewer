@@ -16,7 +16,7 @@ func (s *Server) handleListRoots(c *gin.Context) {
 }
 
 // handleListDir 返回指定目录的单层子节点（懒加载目录树）。
-// 目录节点全部展示；文件节点仅展示 .log / .out 后缀。
+// 目录节点全部展示；文件节点按配置的 file_extensions 过滤（默认 .log/.out）。
 func (s *Server) handleListDir(c *gin.Context) {
 	h, ok := s.hostFrom(c)
 	if !ok {

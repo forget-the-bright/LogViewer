@@ -227,3 +227,15 @@ func TestNormalizeExts(t *testing.T) {
 		t.Errorf("应补点并小写去空白: %v", set)
 	}
 }
+
+func TestLocalHostDisplayName(t *testing.T) {
+	h := newTestLocal(t, t.TempDir())
+	// 默认无 displayName 时 Info().DisplayName 为空
+	if info := h.Info(); info.DisplayName != "" {
+		t.Errorf("默认 DisplayName 应为空，got %q", info.DisplayName)
+	}
+	h.SetDisplayName("我的机器")
+	if info := h.Info(); info.DisplayName != "我的机器" {
+		t.Errorf("DisplayName = %q, want %q", info.DisplayName, "我的机器")
+	}
+}

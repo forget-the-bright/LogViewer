@@ -95,3 +95,31 @@ func TestLocalHost_Fingerprint(t *testing.T) {
 		t.Fatalf("不同 dirs 指纹应不同")
 	}
 }
+
+// TestRebuild_SyncsDisplayName 固化热加载语义：仅修改 display_name 时实例保持不变
+// （不中断日志读取），但新显示名必须同步到旧实例，否则前端下拉框要重启才刷新。
+func TestRebuild_SyncsDisplayName(t *testing.T) {
+	h1 := newLocalForTest(t, "local", []string{"/tmp/a"})
+	h1.SetDisplayName("旧名字")
+	m, err := NewManager(h1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 同 dirs（指纹相同）但换了 display_name
+	h2 := newLocalForTest(t, "local", []string{"/tmp/a"})
+	h2.SetDisplayName("新名字")
+	changed := m.Rebuild([]Host{h2})
+
+	// 实例未被替换 → 不应出现在 changed 中（不触发重连）
+	if len(changed) != 0 {
+		t.Fatalf("仅改名不应替换实例，changed = %v", changed)
+	}
+	got, _ := m.Get("local")
+	if got != h1 {
+		t.Fatalf("实例应被保留")
+	}
+	if info := got.Info(); info.DisplayName != "新名字" {
+		t.Errorf("显示名未同步: %q", info.DisplayName)
+	}
+}

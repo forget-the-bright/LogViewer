@@ -140,6 +140,13 @@ func TestValidate(t *testing.T) {
 		t.Error("local with ssh should fail")
 	}
 
+	badNoSSH := &AppConfig{Hosts: map[string]HostConfig{
+		"myhost": {Dirs: []string{"/var/log"}},
+	}}
+	if err := badNoSSH.Validate(); err == nil {
+		t.Error("non-local host without ssh should fail")
+	}
+
 	bad2 := &AppConfig{Hosts: map[string]HostConfig{
 		"remote": {SSH: &SSHConfig{Host: "1.2.3.4", Username: "", Password: "x"}},
 	}}
@@ -168,5 +175,36 @@ func TestValidate(t *testing.T) {
 	badGrace.SessionGraceSeconds = 2
 	if err := badGrace.Validate(); err == nil {
 		t.Error("session_grace_seconds below 5 should fail")
+	}
+}
+
+func TestDisplayNameAndFileExtensions(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "logviewer.json")
+	// Use forward slashes to avoid JSON escape issues on Windows
+	dirJSON := filepath.ToSlash(dir)
+	content := `{
+		"hosts": {
+			"local": {
+				"dirs": ["` + dirJSON + `"],
+				"display_name": "我的本机",
+				"file_extensions": [".txt", ".json"],
+				"configs": {}
+			}
+		}
+	}`
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := Load(p, nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	local := cfg.Hosts["local"]
+	if local.DisplayName != "我的本机" {
+		t.Errorf("DisplayName = %q, want %q", local.DisplayName, "我的本机")
+	}
+	if len(local.FileExtensions) != 2 || local.FileExtensions[0] != ".txt" {
+		t.Errorf("FileExtensions = %v, want [.txt .json]", local.FileExtensions)
 	}
 }

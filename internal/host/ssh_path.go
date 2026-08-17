@@ -228,7 +228,7 @@ func (h *SSHHost) ResolvePath(p string) (string, error) {
 	return "", &PathError{msg: "访问超出允许范围（符号链接逃逸）: " + p}
 }
 
-// Ls 列出单层子节点。目录全展示，文件按配置的后缀过滤（默认 .log/.out）。
+// Ls 列出单层子节点。目录全展示，文件按配置的 file_extensions 过滤（默认 .log/.out）。
 func (h *SSHHost) Ls(dir string) ([]Node, error) {
 	abs, err := h.ResolvePath(dir)
 	if err != nil {

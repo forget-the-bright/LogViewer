@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"logviewer/internal/cmdbuild"
@@ -19,13 +20,14 @@ import (
 
 // LocalHost 是本机实现：直接用 os.* 访问文件、用 exec 启动原生命令。
 type LocalHost struct {
-	name      string
-	platform  string
-	roots     []string // 已 Abs+Clean 的根目录
-	realRoots []string // roots 经 EvalSymlinks 后的真实路径（用于软链穿越校验）
-	exts      map[string]bool
-	showAll   bool // true 时展示所有文件（file_extensions 含 "*"）
-	cfgMgr    *config.Manager
+	name        string
+	displayName atomic.Pointer[string]
+	platform    string
+	roots       []string // 已 Abs+Clean 的根目录
+	realRoots   []string // roots 经 EvalSymlinks 后的真实路径（用于软链穿越校验）
+	exts        map[string]bool
+	showAll     bool // true 时展示所有文件（file_extensions 含 "*"）
+	cfgMgr      *config.Manager
 }
 
 // NewLocalHost 构造本机 Host。
@@ -81,6 +83,20 @@ func (h *LocalHost) Name() string             { return h.name }
 func (h *LocalHost) Platform() string         { return h.platform }
 func (h *LocalHost) Configs() *config.Manager { return h.cfgMgr }
 
+// SetDisplayName 设置前端显示的友好名称。为空时前端回退到 Name()。
+// 并发安全：Rebuild 热加载时可能与 healthz 等无锁 Info() 读取并发。
+func (h *LocalHost) SetDisplayName(name string) {
+	h.displayName.Store(&name)
+}
+
+// DisplayName 返回当前显示名（可能为空）。
+func (h *LocalHost) DisplayName() string {
+	if p := h.displayName.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 // Fingerprint 返回本机实例的连接配置指纹，供 Manager.Rebuild 判断是否需要替换。
 // 本机的可变身份是根目录集合（dirs）：热加载改了 dirs 就必须让新实例生效，
 // 否则目录树永远停在旧集合上。name 已由 Manager 按别名匹配，这里只需编码 dirs。
@@ -100,11 +116,12 @@ func (h *LocalHost) Fingerprint() string {
 
 func (h *LocalHost) Info() Info {
 	return Info{
-		Name:      h.name,
-		Platform:  h.platform,
-		Local:     true,
-		Online:    true,
-		Available: true,
+		Name:        h.name,
+		DisplayName: h.DisplayName(),
+		Platform:    h.platform,
+		Local:       true,
+		Online:      true,
+		Available:   true,
 	}
 }
 
@@ -176,7 +193,7 @@ func within(p, root string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// Ls 返回单层子节点（懒加载）。目录全展示，文件只展示 .log/.out。
+// Ls 返回单层子节点（懒加载）。目录全展示，文件按配置的 file_extensions 过滤（默认 .log/.out）。
 func (h *LocalHost) Ls(dir string) ([]Node, error) {
 	abs, err := h.ResolvePath(dir)
 	if err != nil {

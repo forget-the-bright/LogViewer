@@ -43,13 +43,14 @@ type Capabilities struct {
 // 主机密钥默认 TOFU：首次连接写入 known_hosts_file，之后严格校验；
 // 仅当显式 insecure_skip_host_key=true 才跳过（有日志警告）。
 type SSHHost struct {
-	name     string
-	sshCfg   appconfig.SSHConfig
-	dirs     []string // 远端根目录（按配置原样保留，不做本机 Abs）
-	platform string   // 配置显式指定的平台（空=自动探测）
-	exts     map[string]bool
-	showAll  bool // true 时展示所有文件（file_extensions 含 "*"）
-	cfgMgr   *config.Manager
+	name        string
+	displayName string
+	sshCfg      appconfig.SSHConfig
+	dirs        []string // 远端根目录（按配置原样保留，不做本机 Abs）
+	platform    string   // 配置显式指定的平台（空=自动探测）
+	exts        map[string]bool
+	showAll     bool // true 时展示所有文件（file_extensions 含 "*"）
+	cfgMgr      *config.Manager
 
 	mu            sync.Mutex
 	reconnMu      sync.Mutex // 串行化重连，防止并发失败操作触发多次拨号
@@ -136,6 +137,21 @@ func NewSSHHost(name string, sshCfg appconfig.SSHConfig, platform string, dirs [
 func (h *SSHHost) Name() string             { return h.name }
 func (h *SSHHost) Configs() *config.Manager { return h.cfgMgr }
 
+// SetDisplayName 设置前端显示的友好名称。为空时前端回退到 Name()。
+// 并发安全：Rebuild 热加载时可能与 healthz 等调用 Info() 并发，用 h.mu 保护。
+func (h *SSHHost) SetDisplayName(name string) {
+	h.mu.Lock()
+	h.displayName = name
+	h.mu.Unlock()
+}
+
+// DisplayName 返回当前显示名（可能为空）。
+func (h *SSHHost) DisplayName() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.displayName
+}
+
 func (h *SSHHost) Dirs() []string {
 	out := make([]string, len(h.dirs))
 	copy(out, h.dirs)
@@ -163,6 +179,7 @@ func (h *SSHHost) Info() Info {
 	if h.lastErr != nil {
 		errMsg = h.lastErr.Error()
 	}
+	displayName := h.displayName
 	h.mu.Unlock()
 
 	msg := "未连接"
@@ -172,12 +189,13 @@ func (h *SSHHost) Info() Info {
 		msg = errMsg
 	}
 	return Info{
-		Name:      h.name,
-		Platform:  p,
-		Local:     false,
-		Online:    online,
-		Available: online,
-		Message:   msg,
+		Name:        h.name,
+		DisplayName: displayName,
+		Platform:    p,
+		Local:       false,
+		Online:      online,
+		Available:   online,
+		Message:     msg,
 	}
 }
 

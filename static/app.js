@@ -606,6 +606,18 @@
   // ============ 目录树 ============
   const treeEl = $("tree");
 
+  // 主机在顶栏下拉中的显示文本。
+  // displayName 优先；本机（h.local）在显示名后追加 "-local" 后缀以区分远程主机。
+  function hostDisplayLabel(h) {
+    let label = h.displayName || h.name;
+    if (h.local && label !== "local" && !label.endsWith("-local")) {
+      label += "-local";
+    }
+    const plat = h.platform || t("unknown");
+    const status = h.online ? "" : t("offline");
+    return label + " [" + plat + "]" + status;
+  }
+
   // 机器切换：拉取 /api/hosts 填充顶栏选择器。
   async function loadHosts() {
     const data = await api("/api/hosts");
@@ -615,9 +627,7 @@
     (data.hosts || []).forEach((h) => {
       const opt = document.createElement("option");
       opt.value = h.name;
-      const plat = h.platform || t("unknown");
-      const status = h.online ? "" : t("offline");
-      opt.textContent = h.name + " [" + plat + "]" + status;
+      opt.textContent = hostDisplayLabel(h);
       sel.appendChild(opt);
     });
     // 如果之前选中的主机已不存在，切回 local。
@@ -651,9 +661,7 @@
       const existing = {};
       Array.from(sel.options).forEach((o) => { existing[o.value] = o; });
       hosts.forEach((h) => {
-        const plat = h.platform || t("unknown");
-        const status = h.online ? "" : t("offline");
-        const text = h.name + " [" + plat + "]" + status;
+        const text = hostDisplayLabel(h);
         if (existing[h.name]) {
           existing[h.name].textContent = text;
           delete existing[h.name];

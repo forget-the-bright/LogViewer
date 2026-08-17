@@ -28,12 +28,13 @@ type Node struct {
 
 // Info 描述一台机器的概要信息，供顶栏切换器使用。
 type Info struct {
-	Name      string `json:"name"`
-	Platform  string `json:"platform"`
-	Local     bool   `json:"local"`
-	Online    bool   `json:"online"`
-	Available bool   `json:"available"`
-	Message   string `json:"message,omitempty"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName,omitempty"`
+	Platform    string `json:"platform"`
+	Local       bool   `json:"local"`
+	Online      bool   `json:"online"`
+	Available   bool   `json:"available"`
+	Message     string `json:"message,omitempty"`
 }
 
 // Host 是一台可浏览日志、可执行原生命令的机器。
@@ -127,6 +128,13 @@ func (m *Manager) Names() []string {
 	return append([]string(nil), m.order...)
 }
 
+// displayNameHolder 是可选接口：实现它的 Host 支持在 Rebuild 保留旧实例时
+// 同步显示名（纯外观变化，不需要重建实例或断开连接）。
+type displayNameHolder interface {
+	DisplayName() string
+	SetDisplayName(string)
+}
+
 // Rebuild 原子性地替换主机集合。
 // 新增的主机加入；移除的主机会被 Close（若是 SSHHost）；
 // 已存在且"身份相同"的主机保持不变（不中断正在读取的日志）。
@@ -144,7 +152,14 @@ func (m *Manager) Rebuild(newHosts []Host) []string {
 	for _, h := range newHosts {
 		name := h.Name()
 		if old, ok := oldHosts[name]; ok && hostIdentityEqual(old, h) {
-			// 同一台机器且配置未变，保留旧实例（不断开正在运行的日志读取）
+			// 同一台机器且配置未变，保留旧实例（不断开正在运行的日志读取）。
+			// 但同步 displayName——它是纯外观字段，改了不需要重建实例，
+			// 不更新的话前端下拉框要重启才能看到新名字。
+			if d, ok := old.(displayNameHolder); ok {
+				if nh, ok := h.(displayNameHolder); ok {
+					d.SetDisplayName(nh.DisplayName())
+				}
+			}
 			merged[name] = old
 		} else {
 			// 新机器或配置变更：用新实例

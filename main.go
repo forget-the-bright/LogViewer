@@ -142,7 +142,17 @@ func main() {
 		if platform == "" {
 			platform = "probing"
 		}
-		slog.Info("主机已注册", "kind", kind, "name", info.Name, "platform", platform, "dirs", dirsOf(hm, info.Name))
+		exts := appCfg.Hosts[info.Name].FileExtensions
+		extStr := strings.Join(exts, ",")
+		if extStr == "" {
+			extStr = ".log,.out（默认）"
+		}
+		display := info.DisplayName
+		if display == "" {
+			display = info.Name
+		}
+		slog.Info("主机已注册", "kind", kind, "name", info.Name, "display_name", display,
+			"platform", platform, "dirs", dirsOf(hm, info.Name), "file_extensions", extStr)
 	}
 	// Windows 本机打印实际选用的 PowerShell：pwsh 7+ 启动比 5.1 快约 5 倍，
 	// 未安装时回退系统自带的 powershell 5.1。便于确认优化是否生效。
@@ -303,16 +313,19 @@ func buildHosts(appCfg *appconfig.AppConfig, cfgPath string) ([]host.Host, error
 	if err != nil {
 		return nil, err
 	}
+	local.SetDisplayName(localCfg.DisplayName)
 	hosts := []host.Host{local}
 
 	for name, hc := range appCfg.Hosts {
 		if name == "local" || hc.SSH == nil {
+			// Validate() 已保证非 local 主机必有 ssh；这里防御性跳过。
 			continue
 		}
 		sh, err := host.NewSSHHost(name, *hc.SSH, hc.Platform, hc.Dirs, hc.FileExtensions, hc.Configs, saveCfgFor(name))
 		if err != nil {
 			return nil, fmt.Errorf("初始化机器 %q 失败: %w", name, err)
 		}
+		sh.SetDisplayName(hc.DisplayName)
 		// 重连成功时累加 Prometheus 指标 + 结构化日志（host 包不依赖 metrics）。
 		hostName := name
 		sh.SetOnReconnect(func() {

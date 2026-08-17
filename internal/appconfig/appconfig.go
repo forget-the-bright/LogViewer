@@ -167,6 +167,7 @@ type SSHConfig struct {
 type HostConfig struct {
 	SSH            *SSHConfig         `json:"ssh,omitempty"`
 	Platform       string             `json:"platform,omitempty"`
+	DisplayName    string             `json:"display_name,omitempty"`
 	Dirs           []string           `json:"dirs"`
 	FileExtensions []string           `json:"file_extensions,omitempty"`
 	Configs        config.ConfigStore `json:"configs"`
@@ -362,6 +363,9 @@ func (c *AppConfig) Validate() error {
 		}
 		if name == "local" && h.SSH != nil {
 			return errors.New("local 是内置本机别名，不能配置 ssh 字段")
+		}
+		if name != "local" && h.SSH == nil {
+			return fmt.Errorf("机器 %q 缺少 ssh 配置（只有内置 local 主机可以不配 ssh）", name)
 		}
 		if h.SSH != nil {
 			if h.SSH.Host == "" {

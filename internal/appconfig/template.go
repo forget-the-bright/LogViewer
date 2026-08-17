@@ -56,6 +56,8 @@ func defaultTemplate() string {
 
   "hosts": {
     "local": {
+      // 前端显示的友好名称（留空则显示 "local"）。本机会自动追加 "-local" 后缀。
+      // "display_name": "我的机器",
       // 本机扫描目录；命令行 -dir 传入的目录会追加到这里并去重。
       "dirs": [],
       // 目录树展示的文件后缀（不区分大小写，可省略前导点）。
@@ -89,7 +91,8 @@ func defaultTemplate() string {
         }
       }
     }
-    // 机器列表。键名即界面上显示的别名；"local" 是内置本机，无需 ssh 字段。
+    // 机器列表。键名是内部标识（API 路由用），display_name 是界面显示名（留空则显示键名）。
+    // "local" 是内置本机，无需 ssh 字段；非 "local" 的主机必须配置 ssh。
     // 添加远程机器示例（取消注释并修改）：
     //
     // "prod-web-01": {
@@ -103,6 +106,7 @@ func defaultTemplate() string {
     //     "connect_timeout_seconds": 10,
     //     "keepalive_seconds": 30
     //   },
+    //   "display_name": "生产-Web-01",   // 前端显示的友好名称（留空则显示键名）
     //   "platform": "",                  // 留空自动探测（linux/darwin/windows）
     //   "dirs": ["/var/log/nginx"],
     //   "file_extensions": [".log", ".out"],  // 目录树展示的文件后缀，缺省 .log/.out；["*"] 展示全部

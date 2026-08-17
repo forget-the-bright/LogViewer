@@ -169,20 +169,26 @@ func TestPatchHostConfigsNonExistentHostFallback(t *testing.T) {
 	}
 
 	newStore := config.NewConfigStore()
-	// 对不存在的 host 打补丁：应回退到全量 Save（不会丢失字段）
+	// 对不存在的 host 打补丁：应回退到全量 Save（不会丢失字段）。
+	// 回退创建的条目只有 configs（Validate 会拒绝非 local 无 ssh 的主机），
+	// 因此直接检查文件内容，不走 Load+Validate。
 	if err := PatchHostConfigs(path, "new-host", newStore); err != nil {
 		t.Fatalf("PatchHostConfigs failed: %v", err)
 	}
 
-	cfg, _, err := Load(path, nil)
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("重载配置失败: %v", err)
+		t.Fatal(err)
 	}
-	if _, ok := cfg.Hosts["new-host"]; !ok {
+	s := string(raw)
+	if !strings.Contains(s, `"new-host"`) {
 		t.Error("new-host 未被创建")
 	}
-	if _, ok := cfg.Hosts["local"]; !ok {
+	if !strings.Contains(s, `"local"`) {
 		t.Error("local 主机丢失")
+	}
+	if !strings.Contains(s, `":8080"`) {
+		t.Error("addr 字段丢失")
 	}
 }
 
