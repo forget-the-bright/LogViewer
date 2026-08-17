@@ -172,13 +172,22 @@ func main() {
 		return newCfg, changed, nil
 	}
 
+	// logCommandsFn 读取当前配置的 log_commands 开关。走 cfgMu 与 reload 互斥，
+	// 保证热加载切换开关后即时生效，且不会读到半更新的 appCfg 指针。
+	logCommandsFn := func() bool {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		return appCfg.LogCommands
+	}
+
 	srv := server.New(server.Options{
-		Hosts:        hm,
-		Static:       sub,
-		Auth:         appCfg.Auth,
-		ConfigPath:   cfgPath,
-		SessionGrace: time.Duration(appCfg.SessionGraceSeconds) * time.Second,
-		ReloadFunc:   reloadCfg,
+		Hosts:           hm,
+		Static:          sub,
+		Auth:            appCfg.Auth,
+		ConfigPath:      cfgPath,
+		SessionGrace:    time.Duration(appCfg.SessionGraceSeconds) * time.Second,
+		ReloadFunc:      reloadCfg,
+		LogCommandsFunc: logCommandsFn,
 	})
 	displayAddr := listenAddr
 	if strings.HasPrefix(displayAddr, ":") {

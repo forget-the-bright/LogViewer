@@ -44,45 +44,59 @@ func TestAssemblePattern(t *testing.T) {
 }
 
 func TestTimeBounds(t *testing.T) {
-	cases := []struct {
-		name        string
-		rule        config.FilterRule
-		wantStart   string
-		wantEnd     string
-		wantEnabled bool
+	// 合法输入：应返回正确端点且 err == nil
+	valid := []struct {
+		name      string
+		rule      config.FilterRule
+		wantStart string
+		wantEnd   string
 	}{
-		{"empty", config.FilterRule{}, "", "", false},
+		{"empty", config.FilterRule{}, "", ""},
 		{"day", config.FilterRule{TimeStart: "2024-01-01", TimeEnd: "2024-01-01", TimePrecision: "day"},
-			"2024-01-01 00:00:00", "2024-01-01 23:59:59", true},
+			"2024-01-01 00:00:00", "2024-01-01 23:59:59"},
 		{"hour", config.FilterRule{TimeStart: "2024-01-01 07", TimeEnd: "2024-01-01 08", TimePrecision: "hour"},
-			"2024-01-01 07:00:00", "2024-01-01 08:59:59", true},
+			"2024-01-01 07:00:00", "2024-01-01 08:59:59"},
 		{"minute", config.FilterRule{TimeStart: "2024-01-01 07:01", TimeEnd: "2024-01-01 07:05", TimePrecision: "minute"},
-			"2024-01-01 07:01:00", "2024-01-01 07:05:59", true},
+			"2024-01-01 07:01:00", "2024-01-01 07:05:59"},
 		{"second", config.FilterRule{TimeStart: "2024-01-01 07:01:14", TimeEnd: "2024-01-01 07:02:30", TimePrecision: "second"},
-			"2024-01-01 07:01:14", "2024-01-01 07:02:30", true},
+			"2024-01-01 07:01:14", "2024-01-01 07:02:30"},
 		{"default second", config.FilterRule{TimeStart: "2024-01-01 07:01:14", TimeEnd: "2024-01-01 07:02:30"},
-			"2024-01-01 07:01:14", "2024-01-01 07:02:30", true},
-		// 单边范围：只填起点/终点不应再让过滤失效
+			"2024-01-01 07:01:14", "2024-01-01 07:02:30"},
 		{"only start day", config.FilterRule{TimeStart: "2024-01-01", TimePrecision: "day"},
-			"2024-01-01 00:00:00", "", true},
+			"2024-01-01 00:00:00", ""},
 		{"only end day", config.FilterRule{TimeEnd: "2024-01-01", TimePrecision: "day"},
-			"", "2024-01-01 23:59:59", true},
+			"", "2024-01-01 23:59:59"},
 		{"only start minute", config.FilterRule{TimeStart: "2024-01-01 07:01", TimePrecision: "minute"},
-			"2024-01-01 07:01:00", "", true},
+			"2024-01-01 07:01:00", ""},
 		{"only end second", config.FilterRule{TimeEnd: "2024-01-01 07:02:30"},
-			"", "2024-01-01 07:02:30", true},
-		// 非法区间（终点早于起点）不启用
-		{"reversed", config.FilterRule{TimeStart: "2024-01-02", TimeEnd: "2024-01-01", TimePrecision: "day"},
-			"", "", false},
-		// 一端非法
-		{"bad start", config.FilterRule{TimeStart: "not-a-date", TimeEnd: "2024-01-01", TimePrecision: "day"},
-			"", "", false},
+			"", "2024-01-01 07:02:30"},
 	}
-	for _, c := range cases {
+	for _, c := range valid {
 		t.Run(c.name, func(t *testing.T) {
-			s, e, ok := TimeBounds(c.rule)
-			if ok != c.wantEnabled || s != c.wantStart || e != c.wantEnd {
-				t.Errorf("got (%q,%q,%v) want (%q,%q,%v)", s, e, ok, c.wantStart, c.wantEnd, c.wantEnabled)
+			s, e, err := TimeBounds(c.rule)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if s != c.wantStart || e != c.wantEnd {
+				t.Errorf("got (%q,%q) want (%q,%q)", s, e, c.wantStart, c.wantEnd)
+			}
+		})
+	}
+
+	// 非法输入：必须返回错误（根治旧版"非法输入悄悄退化为读取全部"的问题）
+	invalid := []struct {
+		name string
+		rule config.FilterRule
+	}{
+		{"reversed", config.FilterRule{TimeStart: "2024-01-02", TimeEnd: "2024-01-01", TimePrecision: "day"}},
+		{"bad start", config.FilterRule{TimeStart: "not-a-date", TimeEnd: "2024-01-01", TimePrecision: "day"}},
+		{"bad end", config.FilterRule{TimeStart: "2024-01-01", TimeEnd: "nonsense", TimePrecision: "day"}},
+	}
+	for _, c := range invalid {
+		t.Run(c.name, func(t *testing.T) {
+			s, e, err := TimeBounds(c.rule)
+			if err == nil {
+				t.Fatalf("expected error for invalid input, got (%q,%q,nil)", s, e)
 			}
 		})
 	}

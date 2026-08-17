@@ -1,6 +1,8 @@
 package cmdbuild
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -52,10 +54,15 @@ func AssemblePattern(rule config.FilterRule, useRegex bool) string {
 }
 
 // TimeBounds 按时间粒度把界面输入规整为时间区间（秒级字符串）。
-// 返回 start/end，任一可能为空字符串，表示该侧无界（开区间）；ok=false 表示
-// 完全未设置或输入非法（不应启用时间过滤）。
+// 返回 start/end，任一可能为空字符串，表示该侧无界（开区间）。
 //
-// 支持单边范围（根治旧版"只填一端就整条过滤失效"的问题）：
+// 语义：
+//   - 两端都为空：返回 ("", "", nil)，表示不启用时间过滤；
+//   - 输入合法（含单边范围）：返回秒级端点，err 为 nil；
+//   - 时间串无法解析或终点早于起点：返回 ("", "", err)，调用方必须把错误
+//     返回给用户，而不是悄悄退化成"读取全部日志"。
+//
+// 支持单边范围：
 //   - 只填起点：保留 t >= start 的行
 //   - 只填终点：保留 t <= end 的行
 //   - 两端都填：闭区间 [start, end]
@@ -65,11 +72,11 @@ func AssemblePattern(rule config.FilterRule, useRegex bool) string {
 //   - hour：起点补 :00:00，终点补 :59:59
 //   - minute：起点补 :00，终点补 :59
 //   - second：原样（输入已到秒）
-func TimeBounds(rule config.FilterRule) (start string, end string, ok bool) {
+func TimeBounds(rule config.FilterRule) (start string, end string, err error) {
 	sStr := strings.TrimSpace(rule.TimeStart)
 	eStr := strings.TrimSpace(rule.TimeEnd)
 	if sStr == "" && eStr == "" {
-		return "", "", false
+		return "", "", nil
 	}
 	prec := rule.TimePrecision
 	if prec == "" {
@@ -80,7 +87,7 @@ func TimeBounds(rule config.FilterRule) (start string, end string, ok bool) {
 	if sStr != "" {
 		t, parseOK := parseFlexibleTime(sStr)
 		if !parseOK {
-			return "", "", false
+			return "", "", fmt.Errorf("开始时间格式无法识别: %q", sStr)
 		}
 		startT = snapBound(t, prec, false)
 		hasStart = true
@@ -88,14 +95,14 @@ func TimeBounds(rule config.FilterRule) (start string, end string, ok bool) {
 	if eStr != "" {
 		t, parseOK := parseFlexibleTime(eStr)
 		if !parseOK {
-			return "", "", false
+			return "", "", fmt.Errorf("结束时间格式无法识别: %q", eStr)
 		}
 		endT = snapBound(t, prec, true)
 		hasEnd = true
 	}
-	// 两端都填且终点早于起点：非法区间，不启用过滤。
+	// 两端都填且终点早于起点：非法区间。
 	if hasStart && hasEnd && endT.Before(startT) {
-		return "", "", false
+		return "", "", errors.New("结束时间不能早于开始时间")
 	}
 	if hasStart {
 		start = startT.Format(timeLayout)
@@ -103,7 +110,7 @@ func TimeBounds(rule config.FilterRule) (start string, end string, ok bool) {
 	if hasEnd {
 		end = endT.Format(timeLayout)
 	}
-	return start, end, true
+	return start, end, nil
 }
 
 // snapBound 按粒度对齐单个端点：起点向下取整到段首，终点向上取整到段尾。

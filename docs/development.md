@@ -60,6 +60,8 @@ Windows 下一键全平台打包（自动读取 `VERSION`）：
 后端只是命令的外壳，排查"过滤/跟踪不对"时，最快的方法是把实际拼出来的命令
 拿到终端里直接跑：
 
+- 把配置里的 `log_commands` 设为 `true`（支持热加载），服务端会以 INFO 级别打印
+  每条查询/导出/正则校验命令的 `shell`、`platform` 和完整 `script`，直接复制即可复现。
 - Unix：在日志目录手动执行 `tail -F ... | awk ... | grep ...`。
 - Windows：把 `cmdbuild.go` 里拼出的 PowerShell 脚本粘到 PowerShell 窗口执行。
 

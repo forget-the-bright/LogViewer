@@ -54,8 +54,17 @@ func newAuthService(cfg appconfig.AuthConfig) *authService {
 	return a
 }
 
-func (a *authService) Enabled() bool   { return a.enabled }
-func (a *authService) Username() string { return a.username }
+func (a *authService) Enabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.enabled
+}
+
+func (a *authService) Username() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.username
+}
 
 // newToken 生成 32 字节随机 token（base64url 无填充）。
 func newToken() (string, error) {
@@ -67,6 +76,7 @@ func newToken() (string, error) {
 }
 
 // tooManyFailures 判断某 IP 是否在窗口内超限，并裁剪旧记录。调用方持锁。
+// 当该 IP 的所有失败记录都已过期时，从 map 删除，避免 map 随爆破 IP 数量无限增长。
 func (a *authService) tooManyFailures(ip string, now time.Time) bool {
 	old := a.fails[ip]
 	cutoff := now.Add(-failWindow)
@@ -76,7 +86,11 @@ func (a *authService) tooManyFailures(ip string, now time.Time) bool {
 			kept = append(kept, t)
 		}
 	}
-	a.fails[ip] = kept
+	if len(kept) == 0 {
+		delete(a.fails, ip)
+	} else {
+		a.fails[ip] = kept
+	}
 	return len(kept) >= maxFailAttempts
 }
 
@@ -90,9 +104,13 @@ func (a *authService) Login(user, pass, ip string) (string, bool) {
 		a.mu.Unlock()
 		return "", false
 	}
+	// 在锁内快照用户名/校验函数/TTL，避免与 UpdateAuth 的热更新产生数据竞争。
+	expectedUser := a.username
+	check := a.check
+	ttl := a.ttl
 	a.mu.Unlock()
 
-	if user != a.username || !a.check(pass) {
+	if check == nil || user != expectedUser || !check(pass) {
 		a.mu.Lock()
 		a.fails[ip] = append(a.fails[ip], time.Now())
 		a.mu.Unlock()
@@ -104,11 +122,18 @@ func (a *authService) Login(user, pass, ip string) (string, bool) {
 		return "", false
 	}
 	a.mu.Lock()
-	a.sessions[token] = time.Now().Add(a.ttl)
+	a.sessions[token] = time.Now().Add(ttl)
 	// 登录成功清空该 IP 的失败计数
 	delete(a.fails, ip)
 	a.mu.Unlock()
 	return token, true
+}
+
+// TTL 返回会话有效期（并发安全）。
+func (a *authService) TTL() time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ttl
 }
 
 // validate 校验 token 并滑动续期；过期/不存在返回 false。
@@ -216,7 +241,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误（连续失败多次将被暂时限流）"})
 		return
 	}
-	setSessionCookie(c, token, s.auth.ttl, isTLS(c))
+	setSessionCookie(c, token, s.auth.TTL(), isTLS(c))
 	c.JSON(http.StatusOK, gin.H{"ok": true, "username": s.auth.Username()})
 }
 

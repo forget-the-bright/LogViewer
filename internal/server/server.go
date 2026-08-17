@@ -2,6 +2,7 @@ package server
 
 import (
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"logviewer/internal/appconfig"
+	"logviewer/internal/cmdbuild"
 	"logviewer/internal/host"
 	"logviewer/internal/metrics"
 	"logviewer/internal/procmgr"
@@ -28,6 +30,9 @@ type Options struct {
 	// ReloadFunc 热加载配置：返回新配置、本次被替换/移除的主机别名列表、错误。
 	// 返回的 changed 别名用于通知这些主机上的活跃 WS 连接重连到新实例。
 	ReloadFunc func() (cfg *appconfig.AppConfig, changedHosts []string, err error)
+	// LogCommandsFunc 返回是否应把每条查询命令打印到服务端日志（开发调试用）。
+	// 设计为函数而非固定布尔值，以便配置热加载后即时生效，无需重启。
+	LogCommandsFunc func() bool
 }
 
 // Server 聚合后端各模块。文件/命令操作全部通过 Host 抽象完成，
@@ -50,6 +55,20 @@ type Server struct {
 	sessions *sessionRegistry
 	// sessionGrace 断线后会话保留宽限。
 	sessionGrace time.Duration
+	// logCommandsFn 报告是否打印每条查询命令（开发模式）。为 nil 时视为关闭。
+	logCommandsFn func() bool
+}
+
+// logCmd 在开启 log_commands 时把一条待执行命令打印到服务端日志（DEBUG 级别）。
+// kind 标识命令用途（view/export/regex），host 为目标机器名。
+func (s *Server) logCmd(kind, host string, cmd cmdbuild.Command) {
+	if s.logCommandsFn == nil || !s.logCommandsFn() {
+		return
+	}
+	// 用 INFO 级别（而非 DEBUG）：开发模式开启 log_commands 时，无需同时把
+	// log_level 调到 debug 即可看到命令。多行脚本作为单个字段输出，便于复制。
+	slog.Info("执行查询命令", "kind", kind, "host", host, "shell", cmd.Shell,
+		"platform", cmd.Platform, "script", cmd.Script)
 }
 
 // New 创建 Server。
@@ -63,6 +82,7 @@ func New(opts Options) *Server {
 		reloadFn:     opts.ReloadFunc,
 		wsClients:    map[*wsClient]string{},
 		sessionGrace: opts.SessionGrace,
+		logCommandsFn: opts.LogCommandsFunc,
 	}
 	srv.sessions = newSessionRegistry(srv)
 	return srv
@@ -162,7 +182,7 @@ func (s *Server) hostFrom(c *gin.Context) (host.Host, bool) {
 // 返回空串表示 OK，否则返回可读的错误说明。本机恒通过。
 func checkCaps(h host.Host, encoding string, hasTimeFilter bool) string {
 	caps := h.Capabilities()
-	if isGBK(encoding) && !caps.HasIconv {
+	if cmdbuild.IsGBK(encoding) && !caps.HasIconv {
 		return "远端机器缺少 iconv，无法进行 GBK 转码，请在远端安装后重试"
 	}
 	if hasTimeFilter && !caps.HasAwk {
@@ -172,11 +192,6 @@ func checkCaps(h host.Host, encoding string, hasTimeFilter bool) string {
 		return "远端机器缺少必要命令（tail/cat/grep），无法查看日志"
 	}
 	return ""
-}
-
-func isGBK(enc string) bool {
-	enc = strings.ToLower(strings.TrimSpace(enc))
-	return enc == "gbk" || enc == "gb2312"
 }
 
 // upgrader WebSocket 升级器。CheckOrigin 在启用认证时做同源校验，防止跨站 WS 劫持。

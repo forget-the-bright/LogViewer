@@ -54,6 +54,31 @@ func TestPidFilterReader_StripsMarker(t *testing.T) {
 	}
 }
 
+func TestPidFilterReader_BannerThenMarker(t *testing.T) {
+	// sshd banner/MOTD 可能先于 LV_PID 标记出现；必须在预算内继续扫描，
+	// 同时把 banner 行原样透传，不能因为第一行不是标记就放弃。
+	src := strings.NewReader("Authorized uses only.\nLast login: Mon Aug 17 09:00:00\nLV_PID=12345\nreal output\n")
+	pr := &sshProc{pidCh: make(chan struct{})}
+	r := newPidFilterReader(src, pr)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	want := "Authorized uses only.\nLast login: Mon Aug 17 09:00:00\nreal output\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if pid := pr.getPid(); pid != 12345 {
+		t.Errorf("pid = %d, want 12345 (banner 前导时仍需解析到标记)", pid)
+	}
+	select {
+	case <-pr.pidCh:
+	default:
+		t.Error("pidCh should be closed after parsing PID")
+	}
+}
+
 func TestPidFilterReader_NoMarkerPassesThrough(t *testing.T) {
 	src := strings.NewReader("just some error\n")
 	pr := &sshProc{pidCh: make(chan struct{})}

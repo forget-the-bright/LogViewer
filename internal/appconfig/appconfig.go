@@ -34,6 +34,10 @@ type AppConfig struct {
 	LogJSON bool `json:"log_json"`
 	// LogLevel 控制日志级别：debug/info/warn/error，默认 info。
 	LogLevel string `json:"log_level"`
+	// LogCommands 为 true 时把每条发往目标机器的查询/导出/校验命令打印到服务端日志，
+	// 用于开发调试（排查命令构造、性能问题）。默认 false；生产环境不建议开启
+	// （follow 模式下会持续输出，且命令可能包含文件路径）。
+	LogCommands bool `json:"log_commands"`
 	// SessionGraceSeconds 是 follow 模式下 WebSocket 断线后会话保留的宽限秒数，
 	// 在此期间重连可补齐断连间隙的日志。默认 45 秒。
 	SessionGraceSeconds int `json:"session_grace_seconds"`

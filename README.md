@@ -117,8 +117,9 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 - 通过界面保存过滤预设时，程序仅替换对应主机的 `configs` 子树（hujson AST 局部补丁），
   其余位置的注释与格式保持不变。
 - 顶层可观测性与可靠性字段：`log_json`（true 输出 JSON 结构化日志）、`log_level`
-  （debug/info/warn/error，默认 info）、`session_grace_seconds`（follow 断线会话保留宽限，
-  5–3600，默认 45）。生成的模板内含说明注释。
+  （debug/info/warn/error，默认 info）、`log_commands`（true 打印每条查询/导出/校验命令，
+  开发调试用，默认 false）、`session_grace_seconds`（follow 断线会话保留宽限，5–3600，
+  默认 45）。生成的模板内含说明注释。
 
 ---
 

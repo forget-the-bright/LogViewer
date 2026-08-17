@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -162,20 +163,28 @@ func (p *sshProc) Wait() error {
 			p.waitErr = p.session.Wait()
 		}
 	})
+	if p.waitErr == nil {
+		return nil
+	}
 	// SSH session 被 Close 时会返回 *ssh.ExitMissingError 或 io.EOF，视为正常终止。
-	// 被信号杀死的进程会返回 *ssh.ExitError（非零退出），这也属于预期内的停止，不报错。
-	if p.waitErr != nil {
-		if errors.Is(p.waitErr, io.EOF) {
-			return nil
+	if errors.Is(p.waitErr, io.EOF) {
+		return nil
+	}
+	var emErr *ssh.ExitMissingError
+	if errors.As(p.waitErr, &emErr) {
+		return nil
+	}
+	var exitErr *ssh.ExitError
+	if errors.As(p.waitErr, &exitErr) {
+		// 非零退出：若是我们主动 Kill 的（信号/任务树终止），属于预期停止；
+		// 否则是远程命令自行崩溃，记录 WARN 便于排查（stderr 已转发给前端）。
+		p.pidMu.Lock()
+		killed := p.killCalled
+		p.pidMu.Unlock()
+		if !killed {
+			slog.Warn("远程命令非零退出", "host", p.host.Name(), "exit", exitErr.ExitStatus(), "err", exitErr.String())
 		}
-		var emErr *ssh.ExitMissingError
-		if errors.As(p.waitErr, &emErr) {
-			return nil
-		}
-		var exitErr *ssh.ExitError
-		if errors.As(p.waitErr, &exitErr) {
-			return nil
-		}
+		return nil
 	}
 	return p.waitErr
 }
@@ -354,17 +363,26 @@ func (p *sshProc) getPid() int {
 	return p.remotePid
 }
 
-// pidFilterReader 从 stderr 读取并拦截第一行 "LV_PID=<pid>"，其余原样透传。
-// 远程命令一启动就会打印这行（在管道输出之前），所以用 bufio 逐行扫描是安全的。
+// maxPidBannerLines 是在放弃前扫描 LV_PID 标记所经过的最大 stderr 行数。
+// 正常情况下标记是远程脚本输出的第一行；但某些 sshd 配置会在命令执行前打印
+// banner/MOTD，把标记挤到第 2~N 行。超过此行数仍未找到标记时，认为远端没有
+// 输出 PID（旧版/异常 shell），后续全部原样透传。
+const maxPidBannerLines = 8
+
+// pidFilterReader 从 stderr 读取并拦截 "LV_PID=<pid>" 行，其余原样透传。
+// 标记行可能被 sshd banner 前导，因此在首 maxPidBannerLines 行内持续扫描，
+// 而非只看第一行——否则 banner 会让 setPid 永远不被调用，导致 Kill 无法
+// 精确定位远程进程树，留下孤儿 PowerShell/tail 进程。
 type pidFilterReader struct {
-	src    *bufio.Reader
-	proc   *sshProc
-	passed bool   // 是否已处理完首行
-	buf    []byte // 透传缓冲
+	src       *bufio.Reader
+	proc      *sshProc
+	scanning  bool   // 是否仍在寻找 LV_PID 标记
+	passed    int    // 已扫描的非标记行数
+	buf       []byte // 透传缓冲
 }
 
 func newPidFilterReader(r io.Reader, proc *sshProc) *pidFilterReader {
-	return &pidFilterReader{src: bufio.NewReader(r), proc: proc}
+	return &pidFilterReader{src: bufio.NewReader(r), proc: proc, scanning: true}
 }
 
 func (pr *pidFilterReader) Read(p []byte) (int, error) {
@@ -377,18 +395,23 @@ func (pr *pidFilterReader) Read(p []byte) (int, error) {
 	if line == "" && err != nil {
 		return 0, err
 	}
-	if !pr.passed {
-		pr.passed = true
+	if pr.scanning {
 		if pid, ok := parseLvPid(line); ok {
 			pr.proc.setPid(pid)
-			// 消费掉这行，不向外透传
+			pr.scanning = false
+			// 消费掉标记行，不向外透传
 			if err != nil {
 				return 0, err
 			}
 			return pr.Read(p) // 递归读下一行
 		}
+		pr.passed++
+		if pr.passed >= maxPidBannerLines {
+			// 超过预算仍未找到标记：放弃扫描，后续全部原样透传。
+			pr.scanning = false
+		}
 	}
-	// 非标记行：透传
+	// 非标记行（含 banner）：透传
 	n := copy(p, line)
 	if n < len(line) {
 		pr.buf = []byte(line[n:])

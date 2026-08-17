@@ -35,6 +35,19 @@
     if (pb) pb.textContent = t("pause");
   }
 
+  // 复位一次查看任务的运行态（停止/切换文件/切换主机/断线本地复位时调用）。
+  // 集中清理 running/stopping/waiting、follow 会话标识与暂停状态，避免各处
+  // 漏清 sessionID/lastSeq 导致重连时错误 attach 到上一个会话。
+  function resetRunState() {
+    state.running = false;
+    state.stopping = false;
+    state.waiting = false;
+    state.pendingResume = null;
+    state.sessionID = "";
+    state.lastSeq = 0;
+    resetPauseState();
+  }
+
   // WebSocket 指数退避重连
   const RECONNECT_BASE = 1000;
   const RECONNECT_MAX = 30000;
@@ -500,11 +513,11 @@
   }
   window.addEventListener("resize", fitTerm);
 
-  // 高亮：把一行内命中关键词的片段用 ANSI 包裹
-  function colorizeLine(line, rules) {
+  // 高亮：把一行内命中关键词的片段用 ANSI 包裹。
+  // useRegex/caseSensitive 由调用方随本次查看会话的配置快照传入，不能逐行读实时
+  // DOM——日志持续输出期间用户切换复选框会让同屏各行按不同规则高亮，出现错配。
+  function colorizeLine(line, rules, useRegex, caseSensitive) {
     if (!rules || rules.length === 0) return line;
-    const useRegex = $("useRegex").checked;
-    const caseSensitive = $("caseSensitive").checked;
     const spans = [];
     for (const rule of rules) {
       if (!rule) continue;
@@ -547,7 +560,19 @@
     return out;
   }
 
-  function writeToTerminal(text, highlightRules) {
+  // 取本次查看会话的高亮上下文（规则 + 正则/大小写标志）。
+  // follow 运行中用 activeConfig 快照：用户改表单不影响正在输出的日志；
+  // 静态/尚未启动时回退到当前表单。逐行读实时 DOM 会导致同屏高亮错配。
+  function highlightContext() {
+    const cfg = state.activeConfig || readForm();
+    return {
+      rules: cfg.HighlightRules,
+      useRegex: cfg.UseRegex,
+      caseSensitive: cfg.CaseSensitive,
+    };
+  }
+
+  function writeToTerminal(text, highlightRules, useRegex, caseSensitive) {
     if (!term) return;
     if (state.paused) {
       state.pausedBuffer.push(text);
@@ -572,7 +597,7 @@
       const isLast = i === lines.length - 1;
       // 去掉 CRLF 残留的 '\r'，避免 "\r\r\n" 双回车。
       const clean = l.endsWith("\r") ? l.slice(0, -1) : l;
-      if (clean !== "") out += colorizeLine(clean, highlightRules);
+      if (clean !== "") out += colorizeLine(clean, highlightRules, useRegex, caseSensitive);
       if (!isLast) out += "\r\n";
     }
     term.write(out, () => syncGutter());
@@ -705,12 +730,21 @@
     if (timeDisabled) {
       if (fpStart) fpStart.clear();
       if (fpEnd) fpEnd.clear();
+      // 清空时间后同步刷新预览，否则预览区仍显示已被清除的旧时间范围，
+      // 与实际禁用的时间控件状态不一致。
+      refreshPreview();
     }
   }
 
   // 切换机器：停掉当前 WS、清空目录树与终端、按新 host 重新加载。
+  // hostSwitchGen 是代次令牌：用户快速连切两台主机时，第一次 switchHost 的
+  // 异步加载（loadCapabilities/loadRoots/loadConfigList）可能在第二次之后才
+  // 返回，若<[PLHD79_never_used_51bce0c785ca2f68081bfa7d91973934]>fillForm 旧主机配置覆盖新主机表单。每次进入自增 gen，
+  // 每个 await 之后校验 gen 是否仍为本次——若已被新切换取代则直接放弃后续操作。
+  let hostSwitchGen = 0;
   async function switchHost(name) {
     if (name === currentHost) return;
+    const gen = ++hostSwitchGen;
     currentHost = name;
     // 主动断开旧 WS（wsIntendedClose 阻止自动重连），并取消任何挂起的重连定时器
     state.wsIntendedClose = true;
@@ -722,32 +756,35 @@
       state.ws = null;
     }
     state.connected = false;
-    state.running = false;
-    state.stopping = false;
-    state.waiting = false;
-    state.pendingResume = null;
+    resetRunState();
     state.currentFile = "";
     state.activeConfig = null;
     setConnStatus("offline");
-    resetPauseState();
     treeEl.innerHTML = "";
     $("filePath").value = "";
     resetTerminal();
     try {
       await loadCapabilities();
+      if (gen !== hostSwitchGen) return; // 用户在加载期间又切了主机
       await loadRoots();
+      if (gen !== hostSwitchGen) return;
       await loadConfigList();
+      if (gen !== hostSwitchGen) return;
       const def = await api(hapi("/config/list"));
+      if (gen !== hostSwitchGen) return;
       if (def.default) {
         const cfg = await api(hapi("/config/get?name=" + encodeURIComponent(def.default)));
+        if (gen !== hostSwitchGen) return;
         fillForm(cfg);
       }
       // fillForm 可能选中 gbk，需在加载默认配置后再按能力回退禁用
       applyCapabilities();
     } catch (e) {
+      if (gen !== hostSwitchGen) return;
       const loginShown = $("loginMask") && $("loginMask").classList.contains("show");
       if (!loginShown) toast(t("toastSwitchFailed", { msg: e.message }), "error");
     } finally {
+      if (gen !== hostSwitchGen) return;
       state.wsIntendedClose = false;
       connectWS();
       updateButtons();
@@ -865,11 +902,7 @@
         return;
       }
       wsSend({ action: "stop" });
-      state.running = false;
-      state.stopping = false;
-      state.waiting = false;
-      state.pendingResume = null;
-      resetPauseState();
+      resetRunState();
       resetTerminal();
       setConnStatus("online");
       updateButtons();
@@ -941,10 +974,6 @@
       v = parts[0] + " " + t.join(":");
     }
     return v;
-  }
-
-  function timeInputs() {
-    return { prec: $("timePrecision").value, start: fpStart, end: fpEnd };
   }
 
   // 粒度切换：销毁重建 flatpickr 以改变可选精度，但保留已选时间（以 Date 对象保留）
@@ -1288,7 +1317,10 @@
       if (msg.type === "log") {
         // 记录服务端序号，断线重连时据此请求缺口补发。
         if (typeof msg.seq === "number") state.lastSeq = msg.seq;
-        writeToTerminal(msg.data, state.activeConfig ? state.activeConfig.HighlightRules : readForm().HighlightRules);
+        {
+          const hc = highlightContext();
+          writeToTerminal(msg.data, hc.rules, hc.useRegex, hc.caseSensitive);
+        }
         scheduleFab();
       } else if (msg.type === "reconnect") {
         // 服务器通知主机配置已热更：关闭当前连接，由 onclose 走重连流程
@@ -1397,10 +1429,14 @@
       connectWS();
       return;
     }
-    // 修改过滤参数后重新开始：先停掉后台旧命令，清空控制台与缓冲，再用新配置启动
+    // 修改过滤参数后重新开始：先停掉后台旧命令，清空控制台与缓冲，再用新配置启动。
+    // 清掉上一代 follow 会话标识：start 会拿到全新 sessionID，旧 ID/序号残留
+    // 可能让重连逻辑误 attach 到已销毁会话。
     if (state.running || state.stopping) wsSend({ action: "stop" });
     state.stopping = false;
     state.waiting = false;
+    state.sessionID = "";
+    state.lastSeq = 0;
     resetPauseState();
     resetTerminal();
     const cfg = readForm();
@@ -1418,19 +1454,17 @@
     state.pendingResume = null;
     setConnStatus("stopping");
     updateButtons();
-    wsSend({ action: "stop" });
+    if (!wsSend({ action: "stop" })) {
+      // 连接已断开：服务端无从收到 stop，本连接也没有在管进程，直接本地复位，
+      // 否则界面会永久卡在"停止中"。断线期间的 follow 会话由服务端宽限期管理，
+      // pendingResume 已置空，重连后不会自动恢复。
+      resetRunState();
+      setConnStatus("online");
+      updateButtons();
+    }
   }
 
   // ============ 导出 ============
-  function triggerDownload(url) {
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  }
-
   // 导出遮罩：显示/更新进度，处理中禁用按钮
   let exporting = false;
   let exportAbort = null; // 当前导出的 AbortController，取消按钮用
@@ -1514,9 +1548,18 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
+    // 优先取 RFC 5987 的 filename*=UTF-8''<percent-encoded>（含中文等非 ASCII 文件名）；
+    // 缺失时回退到 ASCII filename="..."。服务端两者都会发，但顺序/存在性不可假设。
     const cd = response.headers.get("Content-Disposition") || "";
-    const m = /filename="?([^"]+)"?/.exec(cd);
-    if (m) a.download = decodeURIComponent(m[1]);
+    let name = "";
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+    if (star && star[1]) {
+      name = decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } else {
+      const m = /filename="?([^";]+)"?/i.exec(cd);
+      if (m) name = decodeURIComponent(m[1].trim());
+    }
+    if (name) a.download = name;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1525,6 +1568,7 @@
 
   // 导出原始：GET 流式下载 + 进度（原始文件有 Content-Length，可显示真实进度）
   async function triggerRawDownload(file) {
+    if (exporting) return;
     showExport(t("exportingRaw"));
     try {
       const r = authCheck(await fetch(hapi("/file/download/origin?path=" + encodeURIComponent(file)),
@@ -1998,17 +2042,22 @@
       });
       $("cfgName").value = newName.trim();
       await loadConfigList();
+      // loadConfigList 重建了下拉选项，需显式选中新名，否则选中态会回落，
+      // 用户看到的"当前配置"与实际 cfgName 输入框不一致。
+      $("configSelect").value = newName.trim();
       toast(t("toastRenamed"), "success");
     }));
 
     $("startBtn").addEventListener("click", () => { startView(); updateButtons(); });
     $("stopBtn").addEventListener("click", () => { stopView(); updateButtons(); });
 
-    // 模式（跟踪/静态）切换：若正在运行先停掉，并刷新按钮文案/联动
+    // 模式（跟踪/静态）切换：若正在运行先停掉，并刷新按钮文案/联动。
+    // 必须走完整运行态复位：旧 follow 会话的 sessionID/lastSeq、暂停缓冲都要清掉，
+    // 否则新模式 start 后重连可能错误 attach 到上一个会话，继续追旧文件/旧配置。
     $("followTail").addEventListener("change", () => {
-      if (state.running) {
+      if (state.running || state.stopping) {
         wsSend({ action: "stop" });
-        state.running = false;
+        resetRunState();
         setConnStatus("online");
         toast(t("toastTaskStoppedRestart"), "success");
       }
@@ -2079,8 +2128,8 @@
           if (term) term.write("\x1b[33m" + t("toastPausedDropped", { n: approxLines }) + "\x1b[0m\r\n");
         }
         if (state.pausedBuffer.length) {
-          const rules = readForm().HighlightRules;
-          writeToTerminal(state.pausedBuffer.join(""), rules);
+          const hc = highlightContext();
+          writeToTerminal(state.pausedBuffer.join(""), hc.rules, hc.useRegex, hc.caseSensitive);
         }
         state.pausedBuffer = [];
         state.pausedBufferChars = 0;
@@ -2092,6 +2141,7 @@
       setGutterVisible(e.target.checked);
     });
     $("copyBtn").addEventListener("click", safeRun(() => {
+      if (!term) return; // 终端未初始化（初始化失败或已销毁）
       const sel = term.getSelection();
       if (!sel) { toast(t("toastNoSelection"), "error"); return; }
       // navigator.clipboard 仅在安全上下文（HTTPS/localhost）下存在；

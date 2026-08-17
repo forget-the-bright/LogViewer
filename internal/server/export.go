@@ -206,17 +206,18 @@ func (s *Server) handleDownloadOrigin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选为目录，请选择日志文件"})
 		return
 	}
-	c.Header("Content-Length", fmt.Sprintf("%d", fi.Size()))
-	c.Header("Content-Disposition", contentDisposition(exportFileName(baseName(abs))))
-	c.Header("Content-Type", "application/octet-stream")
-
+	// 先打开文件，再写下载头：若 Open 失败（权限变更、SSH 连接中断等），
+	// 还能干净地返回 JSON 错误，避免把 Content-Length/Content-Disposition 头
+	// 留在 400/500 响应上导致浏览器下载异常。
 	rc, err := h.Open(abs)
 	if err != nil {
-		// 响应头可能尚未 flush，尝试回 JSON；若已 flush 则只能记录日志。
 		c.JSON(http.StatusBadRequest, gin.H{"error": "打开文件失败: " + err.Error()})
 		return
 	}
 	defer rc.Close()
+	c.Header("Content-Length", fmt.Sprintf("%d", fi.Size()))
+	c.Header("Content-Disposition", contentDisposition(exportFileName(baseName(abs))))
+	c.Header("Content-Type", "application/octet-stream")
 	_, _ = io.Copy(&countingWriter{w: c.Writer, kind: "origin"}, rc)
 }
 
@@ -243,7 +244,13 @@ func (s *Server) handleDownloadFilter(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: " + err.Error()})
 		return
 	}
-	ts, te, _ := cmdbuild.TimeBounds(cfg.FilterRule)
+	ts, te, err := cmdbuild.TimeBounds(cfg.FilterRule)
+	if err != nil {
+		if !(cfg.UseRegex && cfg.FilterRule.CustomRegex != "") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "时间范围无效: " + err.Error()})
+			return
+		}
+	}
 	f := cmdbuild.FilterCfg{
 		Pattern:       cmdbuild.AssemblePattern(cfg.FilterRule, cfg.UseRegex),
 		Exclude:       cfg.FilterRule.Exclude,
@@ -264,7 +271,7 @@ func (s *Server) handleDownloadFilter(c *gin.Context) {
 	}
 	// 正则非法时必须在写响应头【之前】拦截：导出是流式输出，一旦写了下载头，
 	// 后续就无法再用 JSON 报错，进程的 stderr 也不会展示给用户。
-	if msgErr := validateFilter(h, f); msgErr != "" {
+	if msgErr := s.validateFilter(h, f); msgErr != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": msgErr})
 		return
 	}
@@ -285,15 +292,17 @@ func (s *Server) handleDownloadFilter(c *gin.Context) {
 	} else {
 		filteredName = base + "_filtered"
 	}
-	c.Header("Content-Disposition", contentDisposition(filteredName))
-	c.Header("Content-Type", "text/plain; charset=utf-8")
-
+	// 先启动命令，再写下载头：h.Run 失败（SSH 连接中断等）时还能干净地返回 JSON，
+	// 避免把 Content-Disposition 头留在 500 响应上导致浏览器下载异常。
 	exportCmd := cmdbuild.BuildExport(h.Platform(), abs, cfg.Encoding, cfg.ReadLinesLimit, f)
 	slog.Info("导出日志", "host", h.Name(), "file", baseName(abs), "shell", exportCmd.Shell)
+	s.logCmd("export", h.Name(), exportCmd)
 	proc, err := h.Run(exportCmd)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "启动命令失败: " + err.Error()})
 		return
 	}
+	c.Header("Content-Disposition", contentDisposition(filteredName))
+	c.Header("Content-Type", "text/plain; charset=utf-8")
 	streamProcessToResponse(c, proc, "filter")
 }

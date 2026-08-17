@@ -35,9 +35,22 @@
 ## 2. 编码（GBK）
 
 - Unix：在读取命令后接 `iconv -f GBK -t UTF-8`。
-- Windows：
-  - `Get-Content` 用 `-Encoding OEM`（系统 ANSI 代码页，中文环境即 GBK）；
-  - `ReadLines` 用 `[Text.Encoding]::GetEncoding('GBK')` 读取。
+- Windows：用**运行时代码页分流**，避免在中文系统上为转码付出逐行开销：
+  ```powershell
+  if ([Text.Encoding]::Default.CodePage -eq 936) {
+      Get-Content ... -Encoding Default ...      # 中文系统：ANSI=936 即 GBK，纯原生零开销
+  } else {
+      $lv_g=[Text.Encoding]::GetEncoding('GBK'); $lv_d=[Text.Encoding]::Default
+      Get-Content ... -Encoding Default ... |
+        ForEach-Object { $lv_g.GetString($lv_d.GetBytes($_)) }   # 非中文系统：逐行转码
+  }
+  ```
+  - 中文系统（代码页 936）`-Encoding Default` 直接读出 GBK 文本并经控制台 UTF-8 输出，
+    走原生 `-Tail/-Wait` 尾部定位，不引入逐行管道开销；
+  - 非中文系统（如英文 Windows 的 1252/437/850）`Default` 不是 GBK，才把读出的字符串
+    按 Default 编码反解为字节、再用 `GetEncoding('GBK')` 解码为正确文本；
+  - 静态全量无 `-Tail` 需求时用 `[IO.File]::ReadLines(<file>, GetEncoding('GBK'))`。
+  - **不用 `-Encoding OEM`**：OEM 代码页区域相关，在英文 Windows 上是 CP437/850，会乱码。
   由于前面已把控制台输出编码设成 UTF-8，进程吐给 Go 的就是 UTF-8。
 
 ## 3. 时间范围 —— 字符串比较，而不是正则枚举

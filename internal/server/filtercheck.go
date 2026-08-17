@@ -18,17 +18,17 @@ import (
 // 一次进程/会话创建。
 //
 // 返回空串表示通过；否则返回面向用户的中文错误说明。
-func validateFilter(h host.Host, f cmdbuild.FilterCfg) string {
+func (s *Server) validateFilter(h host.Host, f cmdbuild.FilterCfg) string {
 	// 主匹配模式：grep -E / Select-String 始终按正则解释。
 	// （非正则模式下内容经 QuoteMeta 转义，必然合法，但校验一次成本可忽略，保持统一。）
 	if f.Pattern != "" {
-		if msg := runRegexCheck(h, f.Pattern, f.CaseSensitive, "匹配正则"); msg != "" {
+		if msg := s.runRegexCheck(h, f.Pattern, f.CaseSensitive, "匹配正则"); msg != "" {
 			return msg
 		}
 	}
 	// 排除模式：仅"正则"模式下才是正则；非正则走 -F / SimpleMatch（字面量），无需校验。
 	if f.UseRegex && strings.TrimSpace(f.Exclude) != "" {
-		if msg := runRegexCheck(h, f.Exclude, f.CaseSensitive, "排除正则"); msg != "" {
+		if msg := s.runRegexCheck(h, f.Exclude, f.CaseSensitive, "排除正则"); msg != "" {
 			return msg
 		}
 	}
@@ -36,8 +36,9 @@ func validateFilter(h host.Host, f cmdbuild.FilterCfg) string {
 }
 
 // runRegexCheck 在目标机器上执行一次正则空跑校验，返回可读错误（空=通过）。
-func runRegexCheck(h host.Host, pattern string, caseSensitive bool, label string) string {
+func (s *Server) runRegexCheck(h host.Host, pattern string, caseSensitive bool, label string) string {
 	cmd := cmdbuild.BuildRegexCheck(h.Platform(), pattern, caseSensitive)
+	s.logCmd("regex", h.Name(), cmd)
 	out, exitCode, err := h.RunOneShot(cmd)
 	if err != nil {
 		// 连接/会话级失败：不要因此阻塞用户查看（命令稍后真正执行时仍会暴露同类错误），

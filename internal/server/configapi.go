@@ -26,7 +26,7 @@ func (s *Server) handleConfigPreview(c *gin.Context) {
 		return
 	}
 
-	ts, te, _ := cmdbuild.TimeBounds(req.FilterRule)
+	ts, te, timeErr := cmdbuild.TimeBounds(req.FilterRule)
 	f := cmdbuild.FilterCfg{
 		Pattern:       cmdbuild.AssemblePattern(req.FilterRule, req.UseRegex),
 		Exclude:       req.FilterRule.Exclude,
@@ -39,12 +39,15 @@ func (s *Server) handleConfigPreview(c *gin.Context) {
 		f.TimeStart, f.TimeEnd = "", ""
 	}
 
-	// 实时正则校验（在用户停顿 150ms 后触发）：仅正则模式需要——非正则模式下
-	// 内容/级别均经 QuoteMeta 转义，排除走字面量，模式必然合法。
+	// 实时校验（在用户停顿 150ms 后触发）：
+	//   - 时间范围解析错误（自定义正则会覆盖时间范围，此时时间错误无意义，不提示）
+	//   - 正则语法错误（仅正则模式需要：非正则模式下内容/级别均经 QuoteMeta 转义）
 	// 非法时仍返回拼装结果，但带上 regexError，前端据此把输入框标红并展示错误。
 	var regexError string
-	if req.UseRegex {
-		if msg := validateFilter(h, f); msg != "" {
+	if timeErr != nil && !(req.UseRegex && req.FilterRule.CustomRegex != "") {
+		regexError = timeErr.Error()
+	} else if req.UseRegex {
+		if msg := s.validateFilter(h, f); msg != "" {
 			regexError = msg
 		}
 	}
@@ -107,6 +110,12 @@ func (s *Server) handleConfigSave(c *gin.Context) {
 	var cfg config.LogConfig
 	if err := c.ShouldBindJSON(&cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误: " + err.Error()})
+		return
+	}
+	// 保存前校验数值边界：否则越界的 ReadLinesLimit/ContextBefore 会被写入磁盘，
+	// 直到查看/导出时才报错，用户保存时却看到成功，预设配置形同损坏。
+	if err := cfg.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if err := h.Configs().Save(cfg); err != nil {

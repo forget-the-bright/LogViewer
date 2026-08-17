@@ -101,15 +101,26 @@ func (s *Server) handleWS(c *gin.Context) {
 		return nil
 	})
 
-	// 服务端定期发 ping，检测半开连接
+	// 服务端定期发 ping，检测半开连接。
+	// pingDone 在读循环返回时关闭，确保 ping goroutine 立即退出，
+	// 不必等下一个 30s tick 才因 WriteControl 失败而退出。
 	pingTicker := time.NewTicker(wsPingInterval)
-	defer pingTicker.Stop()
+	pingDone := make(chan struct{})
+	defer func() {
+		pingTicker.Stop()
+		close(pingDone)
+	}()
 	go func() {
-		for range pingTicker.C {
-			cl.wmu.Lock()
-			err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait))
-			cl.wmu.Unlock()
-			if err != nil {
+		for {
+			select {
+			case <-pingTicker.C:
+				cl.wmu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait))
+				cl.wmu.Unlock()
+				if err != nil {
+					return
+				}
+			case <-pingDone:
 				return
 			}
 		}
@@ -159,7 +170,6 @@ func (s *Server) startSession(cl *wsClient, msg *wsMessage) {
 			id:       newSessionID(),
 			hostName: cl.hostName,
 			msg:      msg,
-			follow:   true,
 			grace:    grace,
 			client:   cl,
 			reg:      s.sessions,
@@ -256,7 +266,13 @@ func (s *Server) runView(h host.Host, abs string, msg *wsMessage,
 		mode = "follow"
 	}
 	rule := msg.Config.FilterRule
-	ts, te, _ := cmdbuild.TimeBounds(rule)
+	ts, te, err := cmdbuild.TimeBounds(rule)
+	if err != nil {
+		// 自定义正则会覆盖时间范围，此时时间解析错误不影响执行。
+		if !(msg.Config.UseRegex && rule.CustomRegex != "") {
+			return 0, errView("时间范围无效: " + err.Error())
+		}
+	}
 	f := cmdbuild.FilterCfg{
 		Pattern:       cmdbuild.AssemblePattern(rule, msg.Config.UseRegex),
 		Exclude:       rule.Exclude,
@@ -274,13 +290,14 @@ func (s *Server) runView(h host.Host, abs string, msg *wsMessage,
 	if msgErr := checkCaps(h, msg.Config.Encoding, f.TimeStart != "" || f.TimeEnd != ""); msgErr != "" {
 		return 0, errView(msgErr)
 	}
-	if msgErr := validateFilter(h, f); msgErr != "" {
+	if msgErr := s.validateFilter(h, f); msgErr != "" {
 		return 0, errView(msgErr)
 	}
 	viewCmd := cmdbuild.BuildView(h.Platform(), mode, abs, msg.Config.Encoding, msg.Config.ReadLinesLimit, f)
 	slog.Info("启动日志查看",
 		"host", h.Name(), "mode", mode, "file", baseName(abs),
 		"config", msg.Config.ConfigName, "shell", viewCmd.Shell)
+	s.logCmd("view", h.Name(), viewCmd)
 	proc, err := h.Run(viewCmd)
 	if err != nil {
 		return 0, err

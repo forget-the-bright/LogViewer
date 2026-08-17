@@ -4,6 +4,63 @@
 构建时通过 `-ldflags "-X main.version=..."` 注入。格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [v0.0.6] - 2026-08-17
+
+一次可靠性与正确性加固版本：修复上一轮编码改造引入的 Windows GBK 性能回退，
+补齐时间过滤/认证/会话/导出等环节的边界与竞态问题，新增开发期命令日志开关。
+
+### 新增
+- **`log_commands` 开发模式配置**：设为 `true` 时把每条发往目标机器的查询/导出/
+  正则校验命令（shell、platform、完整脚本）以 INFO 级别打印到服务端日志，用于排查
+  命令构造与性能问题。支持热加载即时生效；生产环境不建议开启（follow 会持续输出，
+  且命令可能包含文件路径）。
+
+### 修复
+- **P0 Windows GBK 查询性能回退**：上一版编码改造在所有 Windows GBK 路径上引入了
+  逐行 `ForEach-Object` 转码或 `ReadLines` 全量枚举，中文机（代码页 936，转码本是
+  恒等映射）也照跑，静态/跟踪、带不带过滤都明显变慢。改为**运行时代码页分流**
+  （`[Text.Encoding]::Default.CodePage -eq 936`）：中文系统走纯原生
+  `Get-Content -Encoding Default -Wait/-Tail`，与旧版性能一致（实测 ~51ms，对比
+  逐行转码 ~124ms、ReadLines ~617ms）；非中文系统才在 else 分支逐行用
+  `GetEncoding('GBK')` 转码。`-Encoding Default` 取代了区域相关、英文系统上会
+  乱码的 `-Encoding OEM`。
+- **时间过滤非法输入静默退化为"读取全部"**：`TimeBounds` 签名由 `(start,end,ok bool)`
+  改为 `(start,end,err error)`，无法解析的时间串、终点早于起点一律返回错误；
+  查看/导出/预览三处调用方在写响应头/启动命令前把错误返回给用户，不再悄悄返回全量日志。
+- **认证热更新数据竞争**：`Enabled()`/`Username()`/`Login()` 此前无锁读取
+  `enabled/username/check/ttl`，与 `UpdateAuth` 的热更新构成数据竞争（`go test -race`
+  可复现）。`Login()` 在锁内快照校验所需字段，新增并发安全的 `TTL()`；
+  `tooManyFailures` 在某 IP 的失败记录全部过期时从 map 删除，避免随爆破 IP 无限增长。
+- **断线补齐日志乱序**：`viewSession.attach` 原先先取 `mu` 再取 `writeMu`，两次加锁
+  之间实时 `onStdout` 可能先写入一帧，导致补发帧（seq 较小）排在实时帧之后。
+  调整锁序为先 `writeMu` 后 `mu`，整个补发期间阻塞实时写入，保证补发先于实时到达。
+- **WS ping goroutine 泄漏**：连接断开后 ping goroutine 要等下一个 30s tick 写入失败
+  才退出。新增 `pingDone` channel，读循环返回时立即关闭，goroutine 即时退出。
+- **导出失败仍带着下载头**：原始/过滤导出此前先写 `Content-Disposition`/`Content-Type`
+  再打开文件或启动命令，一旦 Open/Run 失败（权限变更、SSH 中断），错误 JSON 会带着
+  下载头返回，浏览器下载行为异常。改为先打开/启动成功再写下载头，失败干净返回 JSON。
+- **保存预设不校验数值边界**：越界的读取行数/上下文行数能被"成功"保存，直到查看/导出
+  才报错，预设形同损坏。`handleConfigSave` 在写盘前调用 `cfg.Validate()`。
+- **SSH 远程命令 PID 解析/退出日志**：`pidFilterReader` 改为扫描前若干行 banner 再定位
+  `LV_PID=` 标记（兼容登录脚本输出的 banner），banner 行原样透传；`Wait()` 对非主动
+  杀死的非零退出记录 `slog.Warn`，不再静默吞掉。
+- **前端**：
+  - 集中 `resetRunState()` 清理 `sessionID/lastSeq`，修复切换主机/文件/模式、停止、
+    断线复位时残留旧会话标识导致重连错误 attach 到已销毁会话的问题。
+  - 高亮规则/正则/大小写标志改为随本次查看会话的配置快照传入（`highlightContext()`），
+    不再逐行读实时 DOM，修复 follow 输出期间用户改复选框导致同屏各行高亮错配。
+  - 切换主机引入 `hostSwitchGen` 代次令牌，快速连切两台主机时旧的异步加载不会再用
+    旧主机配置覆盖新主机表单。
+  - 连接已断时点停止不再永久卡在"停止中"：`wsSend` 失败时本地复位运行态。
+  - 导出文件名优先解析 RFC 5987 `filename*=UTF-8''...`，修复中文名下载乱码；
+    原始导出加在途锁防重复触发。
+  - 重命名预设后显式选中新名；切换能力清空时间选择器后同步刷新预览；复制按钮对未初始
+    化终端做空值守卫；移除无用的 `triggerDownload`/`timeInputs`。
+
+### 变更
+- 正则校验函数 `validateFilter`/`runRegexCheck` 改为 `Server` 方法，以便统一记录命令日志。
+- `viewSession` 移除恒为 true 的冗余 `follow` 字段。
+
 ## [v0.0.5] - 2026-08-17
 
 ### 新增

@@ -37,7 +37,6 @@ type viewSession struct {
 	hostName string
 	abs      string
 	msg      *wsMessage
-	follow   bool
 	grace    time.Duration
 
 	mu         sync.Mutex
@@ -214,7 +213,15 @@ func (sess *viewSession) sendErrorIfAttached(msg string) {
 
 // attach 把新连接绑定到会话：取消宽限定时器，按 lastSeq 补发缺口，随后恢复实时下发。
 // 返回 true 表示成功接管；false 表示会话已失效（进程已退出/被销毁），调用方应回退到全量重启。
+//
+// 锁序：先 writeMu 再 mu。onStdout 在 mu 下取 client 后释放 mu，再取 writeMu 写实时帧。
+// 若 attach 先 mu 后 writeMu，在两次加锁之间 onStdout 可能拿到新 client 并先写一条实时帧，
+// 导致补发帧（seq < nextSeq）排在实时帧（seq >= nextSeq）之后，客户端日志乱序。
+// 先持 writeMu 可在整个补发期间阻塞 onStdout 的 writeLog，保证补发先于实时到达。
 func (sess *viewSession) attach(cl *wsClient, lastSeq uint64) bool {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+
 	sess.mu.Lock()
 	if sess.closed || sess.procID == 0 {
 		sess.mu.Unlock()
@@ -231,9 +238,6 @@ func (sess *viewSession) attach(cl *wsClient, lastSeq uint64) bool {
 
 	// 在 writeMu 下整体补发：期间任何实时 onStdout 都会阻塞到补发完成后，
 	// 保证补发帧（seq ≤ nextSeq-1）全部先于实时帧（seq ≥ nextSeq）到达。
-	sess.writeMu.Lock()
-	defer sess.writeMu.Unlock()
-
 	if gap {
 		sess.reg.srv.sendText(cl, `{"type":"notice","kind":"gap"}`)
 	}
