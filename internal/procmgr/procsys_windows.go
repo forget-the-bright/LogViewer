@@ -5,16 +5,29 @@ package procmgr
 import (
 	"os/exec"
 	"strconv"
+	"syscall"
 )
 
-// applyProcGroup Windows 下 exec 本身不提供进程组语义，留空；
-// 进程树的终止由 killGroupByPid 用 taskkill /T 完成。
-func applyProcGroup(cmd *exec.Cmd) {}
+// createNoWindow 阻止子进程弹出控制台窗口。GUI 模式（父进程是 windowsgui
+// 子系统、无控制台）下，PowerShell/conhost 会各自闪一个黑窗；web 模式下也能
+// 避免多余的 conhost 窗口。与 PowerShell 的 -WindowStyle Hidden 叠加更彻底。
+const createNoWindow = 0x08000000
+
+// applyProcGroup 为子进程设置 CREATE_NO_WINDOW。
+// exec 在 Windows 不提供进程组语义，进程树终止由 killGroupByPid 用 taskkill /T 完成。
+func applyProcGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= createNoWindow
+}
 
 // killGroupByPid 用 taskkill /T /F 终止整个进程树。
 // 虽然本工具的过滤管道通常在单个 powershell 进程内运行，但 powershell
 // 可能派生子宿主（如某些原生命令、编码转换），/T 能确保连同子孙进程
 // 一并终止，杜绝僵尸 powershell / conhost 残留。
 func killGroupByPid(pid int) {
-	_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+	taskkill := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
+	applyProcGroup(taskkill)
+	_ = taskkill.Run()
 }

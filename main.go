@@ -19,15 +19,10 @@ import (
 	"time"
 
 	"logviewer/internal/appconfig"
-	"logviewer/internal/applog"
-	"logviewer/internal/cmdbuild"
 	"logviewer/internal/config"
 	"logviewer/internal/cryptoutil"
 	"logviewer/internal/host"
 	"logviewer/internal/metrics"
-	"logviewer/internal/server"
-
-	"github.com/gin-gonic/gin"
 )
 
 //go:embed all:static
@@ -38,13 +33,14 @@ var staticFS embed.FS
 var version = "dev"
 
 func main() {
-	addr := flag.String("addr", "", "HTTP 监听地址（覆盖 logviewer.json 中的 addr）")
+	addr := flag.String("addr", "", "HTTP 监听地址（覆盖 logviewer.json 中的 addr，仅 web 模式生效）")
 	dir := flag.String("dir", "", "允许扫描的根工作目录（逗号/分号分隔，合并到本机 local 主机）")
 	configPath := flag.String("config", "", "配置文件路径（默认 <exe>/logviewer.json，其次 <cwd>/logviewer.json）")
 	hashPw := flag.String("hash-password", "", "生成 bcrypt 密码哈希后退出（用于配置 auth.password）")
 	encryptKey := flag.String("key", "", "配置密码解密密钥（也可通过 LOGVIEWER_KEY 环境变量传入）")
 	encryptCfg := flag.Bool("encrypt-config", false, "加密配置文件中所有明文密码，写回文件后退出（需配合 -key）")
 	decryptCfg := flag.Bool("decrypt-config", false, "解密配置文件中所有加密密码，写回文件后退出（需配合 -key）")
+	mode := flag.String("mode", "auto", "运行模式：auto | web | gui。auto 在含 GUI 的构建中默认起窗口，否则起 web 服务")
 	flag.Parse()
 
 	// -hash-password：生成 bcrypt 哈希
@@ -97,130 +93,72 @@ func main() {
 		log.Fatalf("加载静态资源失败: %v", err)
 	}
 
-	// 加载配置
 	var extraDirs []string
 	if *dir != "" {
 		extraDirs = splitList(*dir)
 	}
-	appCfg, cfgPath, err := appconfig.Load(*configPath, extraDirs)
+
+	svc, err := buildService(sub, *configPath, extraDirs, key, guiLogOutput())
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		log.Fatalf("%v", err)
 	}
-	// 尽早初始化结构化日志：此后所有 log.Printf 都会被重定向到 slog。
-	applog.Init(appCfg.LogJSON, appCfg.LogLevel)
-	slog.Info("配置文件已加载", "path", cfgPath, "log_json", appCfg.LogJSON, "log_level", appCfg.LogLevel)
-	if !appCfg.GIN_MODE_DEBUG {
-		gin.SetMode(gin.ReleaseMode)
-	}
-	// 如果配置中有加密密码，必须提供密钥并在内存中解密
-	if appCfg.HasEncryptedPasswords() {
-		if key == "" {
-			log.Fatalf("配置中包含加密密码，必须通过 -key 或 LOGVIEWER_KEY 环境变量提供解密密钥")
-		}
-		if err := appCfg.DecryptPasswords(key); err != nil {
-			log.Fatalf("解密配置密码失败: %v", err)
-		}
-		slog.Info("已使用密钥在内存中解密配置密码")
-	}
+	defer svc.Close()
 
-	listenAddr := *addr
-	if listenAddr == "" {
-		listenAddr = appCfg.Addr
-	}
-
-	// 构造 host.Manager
-	hm, err := buildHostManager(appCfg, cfgPath)
+	runMode, err := resolveMode(*mode)
 	if err != nil {
-		log.Fatalf("初始化机器失败: %v", err)
-	}
-	for _, info := range hm.List() {
-		kind := "local"
-		if !info.Local {
-			kind = "ssh"
-		}
-		platform := info.Platform
-		if platform == "" {
-			platform = "probing"
-		}
-		exts := appCfg.Hosts[info.Name].FileExtensions
-		extStr := strings.Join(exts, ",")
-		if extStr == "" {
-			extStr = ".log,.out（默认）"
-		}
-		display := info.DisplayName
-		if display == "" {
-			display = info.Name
-		}
-		slog.Info("主机已注册", "kind", kind, "name", info.Name, "display_name", display,
-			"platform", platform, "dirs", dirsOf(hm, info.Name), "file_extensions", extStr)
-	}
-	// Windows 本机打印实际选用的 PowerShell：pwsh 7+ 启动比 5.1 快约 5 倍，
-	// 未安装时回退系统自带的 powershell 5.1。便于确认优化是否生效。
-	if local, _ := hm.Get("local"); local != nil && local.Platform() == "windows" {
-		ps := cmdbuild.LocalPowerShell()
-		if strings.EqualFold(ps, "powershell") {
-			slog.Info("本机 PowerShell：powershell 5.1（未检测到 pwsh 7+，安装后日志操作启动可快约 5 倍）", "exe", ps)
-		} else {
-			slog.Info("本机 PowerShell：pwsh 7+", "exe", ps)
-		}
+		log.Fatalf("%v", err)
 	}
 
-	// 配置变更时的持久化闭包（保留 appCfg 引用供 reload 使用）
-	var cfgMu sync.Mutex
-
-	// 重建 host.Manager 的闭包，供 reload 调用。返回被替换/移除的主机别名。
-	rebuildHosts := func(newCfg *appconfig.AppConfig) ([]string, error) {
-		return rebuildHostManager(hm, newCfg, cfgPath)
-	}
-
-	// reload 在锁内更新 appCfg 并重建 host manager
-	reloadCfg := func() (*appconfig.AppConfig, []string, error) {
-		cfgMu.Lock()
-		defer cfgMu.Unlock()
-		newCfg, _, err := appconfig.Load(cfgPath, extraDirs)
-		if err != nil {
-			return nil, nil, err
+	switch runMode {
+	case modeWeb:
+		listenAddr := *addr
+		if listenAddr == "" {
+			listenAddr = svc.Addr()
 		}
-		if newCfg.HasEncryptedPasswords() {
-			if key == "" {
-				return nil, nil, errors.New("配置中包含加密密码，但未提供解密密钥")
-			}
-			if err := newCfg.DecryptPasswords(key); err != nil {
-				return nil, nil, err
-			}
+		log.Fatal(runWeb(svc, listenAddr))
+	case modeGUI:
+		if err := runGUI(svc); err != nil {
+			log.Fatalf("GUI 启动失败: %v", err)
 		}
-		changed, err := rebuildHosts(newCfg)
-		if err != nil {
-			return nil, nil, err
+	}
+}
+
+type runMode int
+
+const (
+	modeWeb runMode = iota
+	modeGUI
+)
+
+// resolveMode 根据 -mode 标志与本构建是否支持 GUI 决定实际运行模式。
+func resolveMode(m string) (runMode, error) {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "web":
+		return modeWeb, nil
+	case "gui":
+		if !supportsGUI() {
+			return 0, errors.New("当前构建为 web-only（不含 GUI）；GUI 需在 Windows 上用 -tags gui 编译")
 		}
-		appCfg = newCfg
-		return newCfg, changed, nil
+		return modeGUI, nil
+	case "auto", "":
+		if supportsGUI() {
+			return modeGUI, nil
+		}
+		return modeWeb, nil
+	default:
+		return 0, fmt.Errorf("mode 只能为 auto、web 或 gui，收到 %q", m)
 	}
+}
 
-	// logCommandsFn 读取当前配置的 log_commands 开关。走 cfgMu 与 reload 互斥，
-	// 保证热加载切换开关后即时生效，且不会读到半更新的 appCfg 指针。
-	logCommandsFn := func() bool {
-		cfgMu.Lock()
-		defer cfgMu.Unlock()
-		return appCfg.LogCommands
-	}
-
-	srv := server.New(server.Options{
-		Hosts:           hm,
-		Static:          sub,
-		Auth:            appCfg.Auth,
-		ConfigPath:      cfgPath,
-		SessionGrace:    time.Duration(appCfg.SessionGraceSeconds) * time.Second,
-		ReloadFunc:      reloadCfg,
-		LogCommandsFunc: logCommandsFn,
-	})
+// runWeb 以传统后台服务模式运行：监听 HTTP，处理信号与 SIGHUP 热加载，直到收到中断。
+func runWeb(svc *service, listenAddr string) error {
 	displayAddr := listenAddr
 	if strings.HasPrefix(displayAddr, ":") {
 		displayAddr = "127.0.0.1" + displayAddr
 	}
-	logStartupWarnings(appCfg, listenAddr)
+	logStartupWarnings(svc.appCfg, listenAddr)
 
-	httpSrv := &http.Server{Addr: listenAddr, Handler: srv.Router()}
+	httpSrv := &http.Server{Addr: listenAddr, Handler: svc.Router()}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -234,16 +172,10 @@ func main() {
 				return
 			case <-sigCh:
 				slog.Info("收到 SIGHUP，正在重新加载配置")
-				if newCfg, changed, err := reloadCfg(); err != nil {
+				if err := reloadAndNotify(svc); err != nil {
 					slog.Error("配置重载失败", "err", err)
 				} else {
-					// 日志配置可能在 reload 中被改动，重新初始化。
-					applog.Init(newCfg.LogJSON, newCfg.LogLevel)
-					srv.UpdateAuth(newCfg.Auth)
-					if n := srv.NotifyHostsChanged(changed); n > 0 {
-						slog.Info("已通知连接因主机配置变更重连", "connections", n)
-					}
-					slog.Info("配置重载成功", "hosts", len(newCfg.Hosts))
+					slog.Info("配置重载成功")
 				}
 			}
 		}
@@ -264,8 +196,22 @@ func main() {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("HTTP 关闭超时", "err", err)
 	}
-	srv.Close()
-	slog.Info("已退出")
+	return nil
+}
+
+// reloadAndNotify 执行一次热加载并把结果应用到 server（更新 auth、日志、通知 WS）。
+func reloadAndNotify(svc *service) error {
+	newCfg, changed, err := svc.Reload()
+	if err != nil {
+		return err
+	}
+	svc.ReinitLogging()
+	svc.UpdateAuth(newCfg.Auth)
+	if n := svc.NotifyHostsChanged(changed); n > 0 {
+		slog.Info("已通知连接因主机配置变更重连", "connections", n)
+	}
+	slog.Info("配置重载成功", "hosts", len(newCfg.Hosts))
+	return nil
 }
 
 func authEnabled(cfg *appconfig.AppConfig) bool {

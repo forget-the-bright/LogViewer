@@ -3,6 +3,11 @@
 一个跨平台的本地日志查看工具。后端用 Go（Gin + WebSocket），前端用原生 HTML/JS +
 [xterm.js](https://xtermjs.org/)，**单二进制自包含**（前端资源通过 `go:embed` 打包进可执行文件）。
 
+支持两种运行形态（同一套代码、同一套 Gin 路由/WS/业务逻辑）：
+- **Web 模式**（默认，全平台）：启动 HTTP 服务，浏览器访问，即原来的 BS 形态。
+- **GUI 模式**（Windows）：用 Wails v2 打开桌面窗口，内置 WebView 加载 `127.0.0.1` 随机端口的
+  内置 Gin 服务；Gin 仅监听 loopback，外部不可访问。前端代码零改动（接口/WS 全部相对路径）。
+
 核心理念：**一切操作都是命令，Go 只是外壳。** 日志的读取、跟踪、过滤、转码全部交给操作系统
 原生命令完成（Linux/macOS：`tail` / `cat` / `awk` / `grep`；Windows：PowerShell
 `Get-Content` / `Where-Object` / `Select-String`），Go 只负责把界面配置翻译成命令、启动进程、
@@ -60,6 +65,9 @@
 - **可拖拽侧栏**：目录树与内容区之间的分隔条可拖拽改宽（180–600px），宽度记忆到浏览器，
   长文件名自动省略号并悬停显示全名。
 - **无残留进程**：停止跟踪或断开 WebSocket 时杀掉整条进程组；退出时优雅关闭，先停进程再断 SSH。
+- **桌面客户端（Windows）**：`-mode gui` 用 Wails 窗口内置 WebView 直接打开，无需浏览器。
+  内置 Gin 只监听 `127.0.0.1` 随机端口（外部不可达），关闭窗口即回收所有日志进程与 SSH 连接；
+  GUI 模式的运行日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
 
 ---
 
@@ -70,15 +78,23 @@
 要求 Go 1.26+。
 
 ```bash
+# web 模式（默认）：启动 HTTP 服务，浏览器访问
 go run .
 # 浏览器打开 http://127.0.0.1:8080
+
+# GUI 模式（需在 Windows 上，并带 gui,production 构建标签）
+go run -tags "gui,production" . -mode gui
 ```
+
+> `go run .` 默认是 web-only 构建；GUI 形态需要 `-tags gui`（外加 Wails v2 运行时要求的
+> `production` 标签）。详细区别见下文「从源码构建」。
 
 ### 命令行参数
 
 | 参数               | 默认    | 说明                                                         |
 | ------------------ | ------- | ------------------------------------------------------------ |
-| `-addr`            | `:8080` | HTTP 监听地址（覆盖 logviewer.json 中的 addr）               |
+| `-mode`            | `auto`  | 运行模式：`auto` / `web` / `gui`。GUI 构建（`-tags gui`）下 `auto` 默认开桌面窗口，web-only 构建下默认起 web 服务 |
+| `-addr`            | `:8080` | HTTP 监听地址（仅 web 模式生效，覆盖 logviewer.json 中的 addr；GUI 模式固定监听 `127.0.0.1` 随机端口） |
 | `-dir`             | （空）  | 允许扫描的根工作目录，逗号 / 分号分隔，可多个。会合并到本机 local 主机的 dirs 并去重 |
 | `-config`          | （空）  | 显式指定配置文件路径                                         |
 | `-hash-password`   | （空）  | 传入明文密码，生成 bcrypt 哈希后退出（用于配置 auth.password） |
@@ -127,6 +143,13 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
 版本号唯一来源是根目录 `VERSION` 文件，通过 `-ldflags "-X main.version=..."` 注入。
 
+项目用 **build tag** 区分两种形态：
+- 默认（不带 tag）：纯 web-only 构建，不含 Wails、无需 CGO，可交叉编译到任意平台。
+- `-tags "gui,production"`：编入 Wails v2 桌面壳，仅支持 Windows（零 CGO，可本机交叉编译
+  amd64/arm64）。`production` 是 Wails v2 运行时强制要求的构建标签，缺失会在启动时报错。
+
+### Web-only（全平台，浏览器访问）
+
 ```bash
 # 当前平台
 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
@@ -135,16 +158,29 @@ go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 ```
 
-> `VERSION` 只能由开发者本人手动修改，AI/自动化不得改动（见 [CLAUDE.md](CLAUDE.md)）。
-
-Windows 下一键全平台打包（自动读取 `VERSION`，6 个目标：windows/linux/darwin × amd64/arm64）：
+一键全平台打包（自动读取 `VERSION`，6 个目标：windows/linux/darwin × amd64/arm64）：
 
 ```powershell
 .\build_all_platforms.ps1
 ```
 
-产物输出到 `dist/`，包名形如 `logviewer-v0.0.4-linux-amd64.tar.gz`。前端资源已嵌入二进制，
+产物输出到 `dist/`，包名形如 `logviewer-<version>-linux-amd64.tar.gz`。前端资源已嵌入二进制，
 部署时只需要拷贝单个可执行文件。
+
+### GUI 客户端（Windows，双击开窗口）
+
+```powershell
+.\build_gui.ps1
+```
+
+产出 `dist/logviewer-gui-<version>-windows-{amd64,arm64}.exe`。脚本内部用
+`-tags "gui,production" -ldflags "-H windowsgui ..."` 编译（`-H windowsgui` 去掉控制台黑窗）。
+双击即可打开桌面窗口；也可加 `-mode web` 让同一份 GUI 二进制退化为纯服务模式（日志写文件）。
+
+> GUI 模式要求目标机器装有 WebView2 Runtime（Win11 自带；Win10 早期版本若缺失需安装
+> 「Microsoft Edge WebView2 Runtime」）。
+>
+> `VERSION` 只能由开发者本人手动修改，AI/自动化不得改动（见 [CLAUDE.md](CLAUDE.md)）。
 
 ---
 
@@ -152,10 +188,14 @@ Windows 下一键全平台打包（自动读取 `VERSION`，6 个目标：window
 
 ```
 LogViewer/
-├── main.go                     # 入口：embed 静态资源、装载模块、启动 Gin
+├── main.go                     # 入口：flag 解析、一次性操作、模式分支（web/gui/auto）
+├── runtime.go                  # 后端运行时装配：配置/主机/Server 构造与热加载（web/gui 共用）
+├── gui_wails.go                # GUI 模式实现（//go:build gui && windows，Wails 窗口壳）
+├── gui_stub.go                 # GUI 空实现（//go:build !(gui && windows)，web-only 构建）
 ├── VERSION                     # 版本号唯一来源（仅开发者手动修改）
 ├── go.mod / go.sum
-├── build_all_platforms.ps1     # 跨平台打包脚本（从 VERSION 读版本号）
+├── build_all_platforms.ps1     # web-only 跨平台打包脚本（6 平台，无 Wails/无 CGO）
+├── build_gui.ps1               # GUI 客户端打包脚本（仅 Windows，-tags gui,production）
 ├── static/                     # 前端（embed 进二进制）
 │   ├── index.html
 │   ├── app.js

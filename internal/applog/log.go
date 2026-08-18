@@ -9,6 +9,7 @@
 package applog
 
 import (
+	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -17,15 +18,22 @@ import (
 
 // Init 配置全局 slog logger，并重定向标准库 log 到它。
 // json 为 true 用 JSON handler，否则用文本 handler；level 取 debug/info/warn/error。
-// 重复调用会重置全局 logger。
+// 重复调用会重置全局 logger。输出写到 os.Stderr。
 func Init(json bool, level string) {
+	InitWithOutput(json, level, os.Stderr)
+}
+
+// InitWithOutput 同 Init，但允许指定日志写入目标。GUI 模式（-H windowsgui）
+// 没有控制台，传入日志文件避免 slog/gin 日志丢失。
+// 重复调用会重置全局 logger。
+func InitWithOutput(json bool, level string, w io.Writer) {
 	lvl := parseLevel(level)
 	opts := &slog.HandlerOptions{Level: lvl}
 	var h slog.Handler
 	if json {
-		h = slog.NewJSONHandler(os.Stderr, opts)
+		h = slog.NewJSONHandler(w, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stderr, opts)
+		h = slog.NewTextHandler(w, opts)
 	}
 	logger := slog.New(h)
 	slog.SetDefault(logger)

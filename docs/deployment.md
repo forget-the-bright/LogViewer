@@ -45,7 +45,21 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-s -w -X main.version=$VER" -o dist
 
 脚本自动从 `VERSION` 读取版本号，在 `dist/` 下生成 6 个压缩包
 （windows/linux/darwin × amd64/arm64），包名形如
-`logviewer-v0.0.4-linux-amd64.tar.gz`。
+`logviewer-<version>-linux-amd64.tar.gz`。这些是 **web-only** 二进制（不含 Wails、
+无 CGO），运行后是浏览器访问的 HTTP 服务。
+
+### GUI 客户端（仅 Windows）
+
+需要桌面客户端形态（双击开窗口，无需浏览器）时，在 Windows 上执行：
+
+```powershell
+.\build_gui.ps1
+```
+
+产出 `dist/logviewer-gui-<version>-windows-{amd64,arm64}.exe`。GUI 二进制内置 Gin 只监听
+`127.0.0.1` 随机端口，运行日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
+目标机器需装有 WebView2 Runtime（Win11 自带）。Web-only 与 GUI 是两套构建产物，
+Linux/macOS 目前只提供 web-only 形态。
 
 ## 2. 运行
 

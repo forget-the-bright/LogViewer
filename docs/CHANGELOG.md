@@ -4,6 +4,73 @@
 构建时通过 `-ldflags "-X main.version=..."` 注入。格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [v0.0.8] - 2026-08-18
+
+新增桌面客户端（GUI）模式，与原 Web 模式共用同一套 Gin 路由 / WebSocket / 业务逻辑，
+前端零改动。
+
+### 新增
+- **GUI 模式（Windows）**：用 Wails v2 打开桌面窗口，内置 WebView 加载 `127.0.0.1`
+  随机端口的内置 Gin 服务。Gin 仅监听 loopback，外部不可访问；关闭窗口即通过
+  `srv.Close()` 回收所有 follow 会话、日志进程与 SSH 连接。前端继续用相对路径走
+  HTTP/WS，无任何硬编码地址。
+- **构建标签分离**：默认 `go build` 产出纯 web-only 二进制（不含 Wails、无 CGO，
+  保留原 6 平台交叉编译）；`-tags "gui,production"` 编入 Wails 桌面壳（仅 Windows，
+  零 CGO，可本机交叉编译 amd64/arm64）。`production` 是 Wails v2 运行时强制要求的
+  构建标签，缺失会在启动时报 "Wails applications will not build without the correct
+  build tags"。
+- **`-mode` 运行参数**：`auto`（默认，GUI 构建开窗口、web-only 构建起服务）/
+  `web` / `gui`。
+- **`build_gui.ps1`**：Windows GUI 一键打包脚本，输出
+  `logviewer-gui-<ver>-windows-{amd64,arm64}.exe`，用 `-H windowsgui` 去掉控制台黑窗。
+- **GUI 日志落盘**：`-H windowsgui` 下无控制台，服务端日志写入
+  `%AppData%\LogViewer\logviewer-gui.log`；`applog` 新增 `InitWithOutput` 支持自定义
+  日志写入目标。
+
+### 修复
+- **GUI 启动后界面无限闪烁**：占位页的 `OnDomReady` 在每次页面加载完成时都会触发，
+  之前未做幂等保护，导致"占位页→跳 Gin→Gin 页再触发跳转"的无限重载，菜单/连接
+  状态无法建立。改用 `sync.Once` 保证只跳转一次，并用 `waitForListener` 轮询
+  `/healthz` 容忍占位页 DOM ready 早于 `OnStartup` 设置监听的竞态。
+- **Windows 子进程控制台弹窗**：`procmgr.applyProcGroup` 此前为空，GUI（无控制台）
+  模式下 spawn 的 PowerShell/conhost 会闪黑窗。设置 `CREATE_NO_WINDOW`
+  （`0x08000000`）创建标志，与 PowerShell 的 `-WindowStyle Hidden` 叠加，web/gui
+  模式均不再弹窗。
+- **后端启动逻辑抽离**：原堆在 `main.go` 的配置加载 / 主机构造 / Server 装配 /
+  SIGHUP 热加载逻辑抽到 `runtime.go` 的 `service` 类型，web 与 gui 两种模式共用，
+  消除重复代码。
+
+### 文档
+- 全局文档同步：README、deployment、development 增加 GUI 模式 / build tag / `-mode`
+  / `build_gui.ps1` 说明；目录结构补 `runtime.go`、`gui_wails.go`、`gui_stub.go`。
+
+## [v0.0.7] - 2026-08-17
+
+三次增量优化：Gin 运行模式可配置、Windows 命令策略按 pwsh7 区分、主机别名与
+热加载可靠性。
+
+### 新增
+- **`gin_mode_debug` 配置**：默认 `false` 时以 `gin.ReleaseMode` 启动（不再打印
+  路由调试日志）；设为 `true` 切回 debug 模式便于开发调试。
+- **主机别名 `display_name`**：`HostConfig` 新增可选显示名，界面下拉用别名展示；
+  本机名自动追加 `-local` 后缀以区分。`Rebuild` 保留同一主机实例时同步更新别名，
+  点"重载配置"即生效，无需重启、不中断正在跟踪的日志（`LocalHost` 用
+  `atomic.Pointer` 保证并发安全）。
+- **启动日志打印主机清单**：启动/重载时 INFO 输出每台主机的 `display_name` 与
+  `file_extensions`，便于确认配置是否生效。
+
+### 变更
+- **Windows 命令策略按 PowerShell 版本区分**：检测到 pwsh 7+ 时用新版原生命令
+  （`Get-Content -Wait/-Tail` 等），否则回退 Windows PowerShell 5.1 兼容写法；
+  SSH 远端同样按探测到的 shell/版本选择命令构造路径，消除跨版本怪癖。
+
+### 修复
+- **非 local 主机缺 ssh 被静默忽略**：`Validate` 此前对 `file_extensions` 写在
+  非 local 键名下等配置错误不报错、悄悄跳过主机，导致配置看似没生效。改为明确
+  返回校验错误。
+- **热加载别名不同步**：主机连接参数未变、实例被复用时，`display_name` 等非连接
+  字段不更新；现在重载时一并同步。
+
 ## [v0.0.6] - 2026-08-17
 
 一次可靠性与正确性加固版本：修复上一轮编码改造引入的 Windows GBK 性能回退，

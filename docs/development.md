@@ -10,32 +10,63 @@
   程序会自动检测并优先使用，本机日志操作启动速度可提升约 5 倍。
   Linux/macOS 需要 `tail`、`cat`、`awk`、`grep`、`iconv`。
 
+## 两种运行形态与构建标签
+
+同一套代码、同一套 Gin 路由/WS/业务逻辑，用 **build tag** 区分两种形态：
+
+- 默认（不带 tag）：**web-only**，纯 Go 二进制，不含 Wails、无需 CGO，可交叉编译到
+  任意平台，运行后是浏览器访问的 HTTP 服务。
+- `-tags "gui,production"`：**GUI 桌面壳**（仅 Windows，Wails v2 + WebView2，零 CGO），
+  双击开窗口。`production` 是 Wails v2 运行时强制要求的标签，缺失会启动报错。
+
+运行模式由 `-mode` 控制：`auto`（默认，GUI 构建开窗口、web-only 构建起服务）/
+`web` / `gui`。GUI 模式忽略 `-addr`，内置 Gin 固定监听 `127.0.0.1` 随机端口
+（外部不可达），无控制台，服务端日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
+
+构建标签相关代码：
+
+| 文件                | 构建约束                        | 作用                                              |
+| ------------------- | ------------------------------- | ------------------------------------------------- |
+| `gui_wails.go`      | `//go:build gui && windows`     | Wails 窗口、内置 Gin 监听、加载占位页后跳转 Gin    |
+| `gui_stub.go`       | `//go:build !(gui && windows)`   | 非 GUI 构建的空实现（`supportsGUI()` 返回 false） |
+| `runtime.go`        | 无                              | web/gui 共用的 service 装配（配置/主机/Server）    |
+
+> 切换构建标签后注意 `go build` 要带全标签，否则 `gui_wails.go` 不参与编译，
+> 里面的改动不会生效。
+
 ## 常用命令
 
 ```bash
-# 运行（默认 :8080，根目录为当前工作目录）
+# 运行（默认 :8080，根目录为当前工作目录）— web-only 构建
 go run .
 
 # 指定端口和扫描根目录
 go run . -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 
-# 编译当前平台（版本号取自 VERSION，未注入时为 dev）
+# 以 GUI 模式运行（仅 Windows，需带 gui,production 标签）
+go run -tags "gui,production" . -mode gui
+
+# 编译当前平台（版本号取自 VERSION，未注入时为 dev）— web-only
 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 
 # 跑单元测试
 go test ./...
 
-# 交叉编译
+# 交叉编译 web-only
 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(cat VERSION)" -o dist/logviewer .
 ```
 
 > 版本号唯一来源是根目录 `VERSION` 文件，**只能由开发者手动修改**，AI/自动化不得改动。
 
-Windows 下一键全平台打包（自动读取 `VERSION`）：
+Windows 下一键打包（均自动读取 `VERSION`）：
 
 ```powershell
+# web-only：6 平台 windows/linux/darwin × amd64/arm64 的 zip/tar.gz
 .\build_all_platforms.ps1
-# 产物在 dist/，包含 windows/linux/darwin × amd64/arm64 的 zip/tar.gz
+
+# GUI 客户端：windows/{amd64,arm64} 单 exe（-tags gui,production -H windowsgui）
+.\build_gui.ps1
+# 产物在 dist/，形如 logviewer-gui-<ver>-windows-amd64.exe
 ```
 
 ## 代码结构速查
@@ -52,7 +83,9 @@ Windows 下一键全平台打包（自动读取 `VERSION`）：
 | WebSocket 协议 / 会话流程  | `internal/server/ws.go`                                |
 | 目录浏览 API               | `internal/server/dir.go`（走 Host.Ls/ResolvePath）     |
 | 导出                       | `internal/server/export.go`                            |
-| 启动参数 / embed           | `main.go`                                              |
+| 启动参数 / embed / 模式分支 | `main.go`                                             |
+| web/gui 共用后端装配       | `runtime.go`（`buildService`/`Reload`/`Close`）        |
+| GUI 窗口壳（Windows）      | `gui_wails.go`（`-tags gui`），空实现 `gui_stub.go`   |
 | 前端所有交互               | `static/app.js`、`static/index.html`、`static/style.css` |
 
 ## 调试技巧
