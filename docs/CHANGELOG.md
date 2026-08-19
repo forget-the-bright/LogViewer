@@ -4,6 +4,31 @@
 构建时通过 `-ldflags "-X main.version=..."` 注入。格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+- **`log_file` 配置项（GUI 模式）**：在 `logviewer.json` 中指定 GUI 模式的日志文件路径，
+  相对路径以可执行文件目录为基准；留空则默认 exe 同目录下的 `logviewer-gui.log`。
+  每次启动截断覆盖旧文件。
+- **`/readyz` 轻量就绪探针**：`GET /readyz` 仅确认 HTTP 服务已启动并能响应请求，不探测
+  SSH 主机连通性，供 GUI 启动轮询使用。与 `/healthz`（含 SSH 探活、可能阻塞）分离。
+
+### 修复
+- **GUI 启动超时（重启电脑后）**：GUI 启动轮询从 `/healthz` 改为 `/readyz`。`/healthz`
+  会对所有 SSH 主机同步执行 `HealthCheck()`，重启电脑后网络/VPN/DNS 尚未就绪时 SSH 连接
+  超时（默认 10s）超过 GUI 等待窗口（8s），导致"内置服务启动超时"弹窗。实际上 HTTP 服务
+  和本机功能已完全可用。改为 `/readyz` 后不再因外部 SSH 不可达而阻塞窗口加载；同时超时
+  从 8s 提高到 15s。
+- **GUI 日志路径从 `%AppData%` 改为 exe 同目录**：`logviewer-gui.log`、`wails.log` 默认
+  写在可执行文件所在目录，不再依赖 `%AppData%\LogViewer\`。
+- **GUI 模式全量控制台输出重定向**：`-H windowsgui` 下没有控制台，现在 `os.Stdout`、
+  `os.Stderr`、Gin 访问日志（`gin.DefaultWriter`/`DefaultErrorWriter`）、slog、标准库
+  `log` 全部重定向到日志文件，不再有输出丢失。
+
+### 变更
+- **Web 模式日志走 stderr**：Web 模式不主动写日志文件，由运行命令通过 shell 重定向
+  决定落盘位置（如 `logviewer.exe > app.log 2>&1`）。`log_file` 配置仅 GUI 模式生效。
+
 ## [v0.0.8] - 2026-08-18
 
 新增桌面客户端（GUI）模式，与原 Web 模式共用同一套 Gin 路由 / WebSocket / 业务逻辑，

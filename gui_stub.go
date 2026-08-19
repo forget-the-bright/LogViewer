@@ -16,4 +16,5 @@ func runGUI(svc *service) error {
 }
 
 // guiLogOutput 在非 GUI 构建返回 nil，日志走 os.Stderr。
-func guiLogOutput() io.Writer { return nil }
+// configPath 参数在 stub 中不使用，仅为与 GUI 构建签名一致。
+func guiLogOutput(configPath string) io.Writer { return nil }

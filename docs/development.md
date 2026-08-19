@@ -21,7 +21,10 @@
 
 运行模式由 `-mode` 控制：`auto`（默认，GUI 构建开窗口、web-only 构建起服务）/
 `web` / `gui`。GUI 模式忽略 `-addr`，内置 Gin 固定监听 `127.0.0.1` 随机端口
-（外部不可达），无控制台，服务端日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
+（外部不可达），无控制台，所有控制台输出（stdout/stderr/Gin 访问日志/slog）全部
+重定向到可执行文件同目录下的 `logviewer-gui.log`（每次启动覆盖），可通过配置项
+`log_file` 自定义路径。Wails 框架自身的 `wails.log` 也在 exe 同目录。
+Web 模式日志走 stderr，由运行命令重定向。
 
 构建标签相关代码：
 

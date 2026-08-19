@@ -36,7 +36,8 @@ type service struct {
 }
 
 // buildService 加载配置、初始化日志、构造全部主机与 Gin server。
-// logOutput 为 nil 时日志写 os.Stderr；GUI 模式传入日志文件。
+// logOutput 为 nil 时日志写 os.Stderr（Web 模式）；GUI 模式传入已打开的日志文件。
+// Web 模式不主动写文件，由运行命令通过 shell 重定向决定日志落盘位置。
 func buildService(staticFS fs.FS, cfgPath string, extraDirs []string, key string, logOutput io.Writer) (*service, error) {
 	if logOutput == nil {
 		logOutput = os.Stderr

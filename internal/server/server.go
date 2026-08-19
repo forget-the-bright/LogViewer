@@ -259,7 +259,9 @@ func (s *Server) Router() *gin.Engine {
 	r.GET("/ws", s.handleWS)
 
 	// 可观测性端点：免鉴权（不含日志内容/敏感数据），便于监控系统直接抓取。
+	// /readyz 仅表明 HTTP 服务已就绪（不探测 SSH 主机），供 GUI 启动轮询；
 	// /healthz 返回各主机连通状态；/metrics 暴露 Prometheus 指标。
+	r.GET("/readyz", s.handleReadyz)
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/metrics", gin.WrapH(metrics.Handler()))
 
@@ -320,6 +322,13 @@ type hostHealth struct {
 	Online    bool   `json:"online"`
 	Available bool   `json:"available"`
 	Message   string `json:"message,omitempty"`
+}
+
+// handleReadyz 是轻量就绪探针：仅表明 HTTP 服务本身已启动并能响应请求，
+// 不探测 SSH 主机连通性。供 GUI 启动轮询使用——SSH 主机不可达不应阻塞窗口加载，
+// 前端会在主机切换器中单独显示离线状态。
+func (s *Server) handleReadyz(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
 // handleHealthz 返回所有主机的连通状态，供外部监控/负载均衡接入。

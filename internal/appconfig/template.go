@@ -44,6 +44,10 @@ func defaultTemplate() string {
   "log_json": false,
   // 日志级别：debug / info / warn / error，默认 info。
   "log_level": "info",
+  // 日志文件路径（仅 GUI 模式生效）。每次启动覆盖（截断）旧文件；留空则默认可执行文件
+  // 同目录下的 logviewer-gui.log。Web 模式日志输出到 stderr，由运行命令重定向。
+  // 相对路径相对于可执行文件所在目录解析。
+  // "log_file": "",
   // 开发调试用：true 时把每条发往目标机器的查询/导出/正则校验命令打印到服务端日志。
   // 默认 false。生产环境不建议开启（follow 模式会持续输出，且命令可能包含文件路径）。
   "log_commands": false,

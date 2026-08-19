@@ -74,14 +74,17 @@
 
 ## 七、可观测性
 
-- ✅ **自身健康端点**：`GET /healthz`（免鉴权）返回 `{status, hosts:[{name,online,available,message}]}`，
+- ✅ **就绪/健康端点**：`GET /readyz`（免鉴权）轻量探针，仅确认 HTTP 服务可用，不探测 SSH；
+  `GET /healthz`（免鉴权）返回 `{status, hosts:[{name,online,available,message}]}`，
   SSH 主机经节流（2s）的 keepalive 探活。
 - ✅ **Prometheus 指标**：`GET /metrics`（promhttp，免鉴权）暴露 `logviewer_ws_connections`、
   `logviewer_log_processes`、`logviewer_ssh_reconnects_total`、`logviewer_export_bytes_total`、
   `logviewer_log_bytes_sent_total`。
-- ✅ **结构化日志**：`log_json`（默认 false 文本）与 `log_level`（默认 info）配置；`internal/applog`
-  早期初始化 slog 并重定向标准库 `log`，高价值调用点（启动/启动查看/SSH 连接与重连/导出/重载/关闭）
-  已迁移为带 `host`/`file`/`mode`/`shell` 字段的结构化日志。
+- ✅ **结构化日志**：`log_json`（默认 false 文本）、`log_level`（默认 info）、`log_file`
+  （GUI 模式日志文件路径）配置；`internal/applog` 早期初始化 slog 并重定向标准库 `log`。
+  GUI 模式下 stdout/stderr/Gin 全部重定向到日志文件；Web 模式走 stderr。高价值调用点
+  （启动/启动查看/SSH 连接与重连/导出/重载/关闭）已迁移为带 `host`/`file`/`mode`/`shell`
+  字段的结构化日志。
 
 ---
 

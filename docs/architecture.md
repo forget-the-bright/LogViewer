@@ -129,7 +129,9 @@ tail/grep 残留。
 - WebSocket：`/ws?host=<alias>`，上行 `start`/`attach`/`stop`/`ping`，下行 `log`（带 `seq`）
   /`error`/`status`（`running`/`stopped`/`waiting`/`alive`）/`notice`（`rotate`/`truncate`/`gap`）
   /`reconnect`（主机热更后通知前端迁移连接）。
-- 可观测性：`GET /healthz`（各主机连通状态，免鉴权）、`GET /metrics`（Prometheus，免鉴权）。
+- 可观测性：`GET /readyz`（轻量就绪探针，仅确认 HTTP 服务可用，不探测 SSH，免鉴权）、
+  `GET /healthz`（各主机连通状态，SSH 探活可能阻塞，免鉴权）、
+  `GET /metrics`（Prometheus，免鉴权）。
   指标见 `internal/metrics`：`logviewer_ws_connections`、`logviewer_log_processes`、
   `logviewer_ssh_reconnects_total`、`logviewer_export_bytes_total`、`logviewer_log_bytes_sent_total`。
 

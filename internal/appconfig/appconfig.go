@@ -34,6 +34,10 @@ type AppConfig struct {
 	LogJSON bool `json:"log_json"`
 	// LogLevel 控制日志级别：debug/info/warn/error，默认 info。
 	LogLevel string `json:"log_level"`
+	// LogFile 指定 GUI 模式的日志文件路径。留空则默认可执行文件同目录下的
+	// logviewer-gui.log；每次启动覆盖（截断）旧文件。Web 模式忽略此字段，
+	// 日志输出到 stderr，由运行命令重定向。
+	LogFile string `json:"log_file"`
 	// LogCommands 为 true 时把每条发往目标机器的查询/导出/校验命令打印到服务端日志，
 	// 用于开发调试（排查命令构造、性能问题）。默认 false；生产环境不建议开启
 	// （follow 模式下会持续输出，且命令可能包含文件路径）。
@@ -242,6 +246,38 @@ func Load(path string, extraDirs []string) (*AppConfig, string, error) {
 		return nil, abs, err
 	}
 	return &cfg, abs, nil
+}
+
+// ReadLogFile 仅从配置文件中提取 log_file 字段，不做完整加载/校验/迁移。
+// 用于 GUI 启动早期（slog 初始化之前）确定日志文件路径；文件不存在或
+// 解析失败时返回空串，调用方回退到默认路径。
+func ReadLogFile(path string) string {
+	if path == "" {
+		p, _, err := Locate("")
+		if err != nil {
+			return ""
+		}
+		path = p
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(abs)
+	if err != nil {
+		return ""
+	}
+	standardized, err := parseJSONC(raw)
+	if err != nil {
+		return ""
+	}
+	var probe struct {
+		LogFile string `json:"log_file"`
+	}
+	if err := json.Unmarshal(standardized, &probe); err != nil {
+		return ""
+	}
+	return probe.LogFile
 }
 
 // Save 把配置写回磁盘（标准 JSON 缩进，原子替换）。

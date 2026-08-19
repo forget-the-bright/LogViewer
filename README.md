@@ -48,8 +48,9 @@
 - **断线补齐**：跟踪会话与 WebSocket 连接解耦，断线宽限期（`session_grace_seconds`，默认 45s）内
   进程持续运行、输出进入 2MB 有界环形缓冲；重连按序号自动补发缺口日志，缓冲溢出时给出丢失提示。
 - **轮转提示**：`tail -F` 检测到日志被轮转/截断时显示可关闭的非红色提示条（不把轮转信息误报为错误）。
-- **可观测性**：`/healthz` 返回各主机连通状态；`/metrics` 暴露 Prometheus 指标（活跃 WS 连接、
-  日志进程数、SSH 重连次数、导出与下发字节数）；服务端日志支持 JSON 结构化输出。
+- **可观测性**：`/readyz` 轻量就绪探针（仅确认 HTTP 服务可用）；`/healthz` 返回各主机连通状态；
+  `/metrics` 暴露 Prometheus 指标（活跃 WS 连接、日志进程数、SSH 重连次数、导出与下发字节数）；
+  服务端日志支持 JSON 结构化输出。
 - **登录认证（可选）**：`auth.enabled=true` 开启会话 Cookie 登录（bcrypt 密码、滑动续期、
   失败限流、WebSocket 同源校验、登出）；默认关闭，关闭时所有功能直接可用。详见
   [部署说明](docs/deployment.md)。
@@ -67,7 +68,8 @@
 - **无残留进程**：停止跟踪或断开 WebSocket 时杀掉整条进程组；退出时优雅关闭，先停进程再断 SSH。
 - **桌面客户端（Windows）**：`-mode gui` 用 Wails 窗口内置 WebView 直接打开，无需浏览器。
   内置 Gin 只监听 `127.0.0.1` 随机端口（外部不可达），关闭窗口即回收所有日志进程与 SSH 连接；
-  GUI 模式的运行日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
+  GUI 模式所有控制台输出（stdout/stderr/Gin 访问日志/slog）全部重定向到日志文件，
+  默认可执行文件同目录下的 `logviewer-gui.log`（每次启动覆盖），可通过 `log_file` 配置自定义路径。
 
 ---
 
@@ -133,9 +135,10 @@ logviewer.exe -addr 127.0.0.1:9000 -dir "D:\logs,C:\tomcat\logs"
 - 通过界面保存过滤预设时，程序仅替换对应主机的 `configs` 子树（hujson AST 局部补丁），
   其余位置的注释与格式保持不变。
 - 顶层可观测性与可靠性字段：`log_json`（true 输出 JSON 结构化日志）、`log_level`
-  （debug/info/warn/error，默认 info）、`log_commands`（true 打印每条查询/导出/校验命令，
-  开发调试用，默认 false）、`session_grace_seconds`（follow 断线会话保留宽限，5–3600，
-  默认 45）。生成的模板内含说明注释。
+  （debug/info/warn/error，默认 info）、`log_file`（仅 GUI 模式，日志文件路径，相对路径以
+  exe 目录为基准，留空默认 exe 同目录 `logviewer-gui.log`）、`log_commands`
+  （true 打印每条查询/导出/校验命令，开发调试用，默认 false）、`session_grace_seconds`
+  （follow 断线会话保留宽限，5–3600，默认 45）。生成的模板内含说明注释。
 
 ---
 
@@ -175,7 +178,8 @@ GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=$(cat VERSION)"
 
 产出 `dist/logviewer-gui-<version>-windows-{amd64,arm64}.exe`。脚本内部用
 `-tags "gui,production" -ldflags "-H windowsgui ..."` 编译（`-H windowsgui` 去掉控制台黑窗）。
-双击即可打开桌面窗口；也可加 `-mode web` 让同一份 GUI 二进制退化为纯服务模式（日志写文件）。
+双击即可打开桌面窗口；也可加 `-mode web` 让同一份 GUI 二进制退化为纯服务模式（日志输出到 stderr，
+由运行命令通过 shell 重定向决定落盘位置，如 `logviewer-gui.exe -mode web > app.log 2>&1`）。
 
 > GUI 模式要求目标机器装有 WebView2 Runtime（Win11 自带；Win10 早期版本若缺失需安装
 > 「Microsoft Edge WebView2 Runtime」）。

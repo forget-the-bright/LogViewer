@@ -57,9 +57,11 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-s -w -X main.version=$VER" -o dist
 ```
 
 产出 `dist/logviewer-gui-<version>-windows-{amd64,arm64}.exe`。GUI 二进制内置 Gin 只监听
-`127.0.0.1` 随机端口，运行日志写入 `%AppData%\LogViewer\logviewer-gui.log`。
-目标机器需装有 WebView2 Runtime（Win11 自带）。Web-only 与 GUI 是两套构建产物，
-Linux/macOS 目前只提供 web-only 形态。
+`127.0.0.1` 随机端口，所有控制台输出（stdout/stderr/Gin 访问日志/slog）全部重定向到
+日志文件，默认可执行文件同目录下的 `logviewer-gui.log`（每次启动覆盖），可通过配置项
+`log_file` 自定义路径（相对路径以 exe 目录为基准）。Wails 框架自身的 `wails.log` 也在
+exe 同目录。目标机器需装有 WebView2 Runtime（Win11 自带）。Web-only 与 GUI 是两套构建
+产物，Linux/macOS 目前只提供 web-only 形态。
 
 ## 2. 运行
 
@@ -92,7 +94,9 @@ logviewer.exe -addr 127.0.0.1:8080 -dir "D:\logs,C:\tomcat\logs"
 程序启动后，会在**可执行文件所在目录**下查找/生成：
 
 ```
-logviewer.json     # 全部配置：监听地址、认证、机器列表、扫描目录、过滤预设
+logviewer.json        # 全部配置：监听地址、认证、机器列表、扫描目录、过滤预设
+logviewer-gui.log     # GUI 模式运行日志（仅 GUI 构建，默认位置，可通过 log_file 配置）
+wails.log             # Wails 框架日志（仅 GUI 构建）
 ```
 
 查找顺序：`-config` 指定路径 → `<exe>/logviewer.json` → `<cwd>/logviewer.json`；
@@ -241,4 +245,5 @@ location / {
 
 - 不要把 `-addr` 直接暴露在公网；启用内置登录或走反向代理并加鉴权。
 - `-dir` 只授予需要查看的日志目录最小权限，不要给整个磁盘根目录。
-- 运行账号对日志目录保持只读即可，程序本身不写日志文件。
+- 运行账号对所查看的日志目录（`-dir` 指定的目录）保持只读即可，程序不会向其中写入文件。
+  GUI 模式自身的 `logviewer-gui.log` 和 `wails.log` 写在 exe 同目录，与被查看的日志目录无关。

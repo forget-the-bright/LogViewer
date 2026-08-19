@@ -98,7 +98,7 @@ func main() {
 		extraDirs = splitList(*dir)
 	}
 
-	svc, err := buildService(sub, *configPath, extraDirs, key, guiLogOutput())
+	svc, err := buildService(sub, *configPath, extraDirs, key, guiLogOutput(*configPath))
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
