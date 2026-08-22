@@ -14,6 +14,17 @@
   SSH 主机连通性，供 GUI 启动轮询使用。与 `/healthz`（含 SSH 探活、可能阻塞）分离。
 
 ### 修复
+- **GUI 本机模式闪黑窗（正则校验路径遗漏）**：长进程路径（查看/导出日志）此前已通过
+  `CREATE_NO_WINDOW` 隐藏控制台，但短命命令 `LocalHost.RunOneShot`（正则语法校验）
+  直接走 `BuildCmd().CombinedOutput()`，**绕过了** 该标志。每次开始读带过滤的日志
+  （WebSocket 启动前校验）、导出、或配置预览（输入停顿 150ms）时都会裸启一个
+  PowerShell，在无控制台的 GUI 父进程下闪现 conhost 黑窗。SSH 远程模式走 SSH 会话、
+  本机不建子进程，故不受影响（解释了"只有 local 会"）。修复：
+  - `procmgr` 导出跨平台 `HideWindow(cmd)`（Windows 设置 `CREATE_NO_WINDOW`，
+    Unix 为 no-op），`applyProcGroup` 与 `RunOneShot` 统一调用它；
+  - `cmdbuild.BuildCmd()` 在构造命令时即应用平台默认值（新增 `cmd_windows.go` /
+    `cmd_other.go`），任何从 `BuildCmd` 产出的本机命令天生无窗，杜绝未来再次遗漏；
+  - 新增 Windows 单元测试锁定 `CREATE_NO_WINDOW` 标志，防止回归。
 - **GUI 启动超时（重启电脑后）**：GUI 启动轮询从 `/healthz` 改为 `/readyz`。`/healthz`
   会对所有 SSH 主机同步执行 `HealthCheck()`，重启电脑后网络/VPN/DNS 尚未就绪时 SSH 连接
   超时（默认 10s）超过 GUI 等待窗口（8s），导致"内置服务启动超时"弹窗。实际上 HTTP 服务

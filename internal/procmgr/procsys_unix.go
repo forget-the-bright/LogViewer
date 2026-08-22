@@ -7,6 +7,9 @@ import (
 	"syscall"
 )
 
+// HideWindow 在非 Windows 平台是空操作：Unix 子进程没有控制台窗口概念。
+func HideWindow(cmd *exec.Cmd) {}
+
 // applyProcGroup 让子进程以独立进程组运行，便于连同整条管道一并终止
 func applyProcGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

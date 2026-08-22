@@ -253,6 +253,9 @@ func (h *LocalHost) Run(cmd cmdbuild.Command) (procmgr.Process, error) {
 // RunOneShot 在本机执行一条短命命令至结束，返回合并输出与退出码。
 func (h *LocalHost) RunOneShot(cmd cmdbuild.Command) (string, int, error) {
 	c := cmd.BuildCmd()
+	// 短命命令（正则校验等）同样在无控制台的 GUI 父进程下运行，必须设置
+	// CREATE_NO_WINDOW，否则每次校验都会闪一个 conhost 黑窗。
+	procmgr.HideWindow(c)
 	out, err := c.CombinedOutput()
 	if err == nil {
 		return string(out), 0, nil

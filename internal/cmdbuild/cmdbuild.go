@@ -56,12 +56,18 @@ type FilterCfg struct {
 
 // BuildCmd 将 Command 转成 *exec.Cmd（本机执行用）。
 // Windows 下优先用 pwsh（PowerShell 7+，启动更快），未安装时回退 powershell 5.1。
+// 同时通过 applyPlatformDefaults 设置平台相关的进程创建默认值
+// （Windows 上为 CREATE_NO_WINDOW，防止 GUI 模式闪黑窗）。
 func (c Command) BuildCmd() *exec.Cmd {
+	var cmd *exec.Cmd
 	if c.Shell == "powershell" {
 		slog.Info("执行本地命令", "shell", localPowerShell)
-		return exec.Command(localPowerShell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", c.Script)
+		cmd = exec.Command(localPowerShell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", c.Script)
+	} else {
+		cmd = exec.Command("sh", "-c", c.Script)
 	}
-	return exec.Command("sh", "-c", c.Script)
+	applyPlatformDefaults(cmd)
+	return cmd
 }
 
 // BuildView 构造一次"查看"命令（静态加载或实时跟踪）。

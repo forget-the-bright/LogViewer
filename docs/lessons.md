@@ -205,6 +205,25 @@ flush 协程，否则它可能在主函数返回后仍在途调用 `outFn`。
 
 ---
 
+## Windows 子进程默认要 CREATE_NO_WINDOW，且必须在构造命令时就保证
+
+GUI 构建用 `-H windowsgui`，父进程没有控制台。此时任何本机 `exec.Command`
+启动的控制台子进程（powershell/pwsh/conhost，包括 `taskkill`）都会被 Windows
+瞬时分配一个 conhost 窗口，表现为黑窗闪现。PowerShell 的 `-WindowStyle Hidden`
+在进程启动**之后**才生效，挡不住这个瞬时窗口；只有创建标志
+`CREATE_NO_WINDOW (0x08000000)`（经 `SysProcAttr.CreationFlags`）在
+`CreateProcess` 阶段阻止它。
+
+**教训：不能只在"主路径"上设这个标志。** 早期只在 `procmgr` 启动长进程时设置，
+却漏掉了直接 `BuildCmd().CombinedOutput()` 的短命命令路径（`RunOneShot`，
+用于正则校验），结果每次读带过滤的日志/预览/导出都闪窗。根治做法是把无窗设为
+**命令构造时的默认值**（`cmdbuild.BuildCmd` → 平台相关 `applyPlatformDefaults`
+→ Windows 上调 `procmgr.HideWindow`），这样无论调用方走长进程还是短命命令、
+无论将来谁新增 `exec` 路径，都不会回归。`procmgr.HideWindow` 导出供需要的地方
+显式调用，幂等可叠加。SSH 路径不受影响——命令在远端执行，本机不建子进程。
+
+---
+
 ## 路径穿越防护
 
 目录浏览和文件读取都接受前端传来的路径。必须校验：`filepath.Abs` →
